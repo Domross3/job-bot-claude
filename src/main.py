@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .pipeline import Pipeline
+from .utils.ingestor import IngestionError, ingest_file
 
 # ── Defaults ─────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -25,13 +26,13 @@ def main() -> None:
         "--resume",
         type=Path,
         default=INPUTS_DIR / "master_resume.md",
-        help="Path to the master resume (text/Markdown)",
+        help="Path to the master resume (.md, .txt, or .pdf)",
     )
     parser.add_argument(
         "--jd",
         type=Path,
         default=INPUTS_DIR / "job_description.md",
-        help="Path to the job description (text/Markdown)",
+        help="Path to the job description (.md, .txt, or .pdf)",
     )
     parser.add_argument(
         "--output",
@@ -54,22 +55,23 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    # ── Validate inputs ─────────────────────────────────────────
-    if not args.resume.exists():
+    # ── Ingest inputs (supports .md, .txt, .pdf) ───────────────
+    try:
+        master_resume = ingest_file(args.resume)
+    except FileNotFoundError:
         print(f"✖  Master resume not found: {args.resume}", file=sys.stderr)
         sys.exit(1)
-    if not args.jd.exists():
+    except IngestionError as exc:
+        print(f"✖  Failed to ingest master resume: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        job_description = ingest_file(args.jd)
+    except FileNotFoundError:
         print(f"✖  Job description not found: {args.jd}", file=sys.stderr)
         sys.exit(1)
-
-    master_resume = args.resume.read_text(encoding="utf-8")
-    job_description = args.jd.read_text(encoding="utf-8")
-
-    if not master_resume.strip():
-        print("✖  Master resume file is empty.", file=sys.stderr)
-        sys.exit(1)
-    if not job_description.strip():
-        print("✖  Job description file is empty.", file=sys.stderr)
+    except IngestionError as exc:
+        print(f"✖  Failed to ingest job description: {exc}", file=sys.stderr)
         sys.exit(1)
 
     # ── Output path ──────────────────────────────────────────────

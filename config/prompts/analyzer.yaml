@@ -7,8 +7,13 @@ system_prompt: |
   - For key_phrases, copy verbatim high-value phrases directly from the JD text.
   - For priority_ranking, rank skills by how prominently they appear (mentioned first, mentioned repeatedly, or listed as "required" rank higher than "nice to have").
   - If a field has no data, use an empty list [] or null as appropriate.
+  - For debugging visibility, you may include a concise high-level reasoning summary inside <thinking> tags. Do NOT include exhaustive hidden chain-of-thought.
 
-  You MUST respond with ONLY a JSON object matching this exact schema (no markdown, no explanation):
+  Place your final JSON object entirely inside <answer> tags. Your response format must be:
+  <thinking>brief high-level reasoning summary</thinking>
+  <answer>{...valid JSON...}</answer>
+
+  You MUST place ONLY the final JSON object matching this exact schema inside <answer> (no markdown, no explanation outside the tags):
 
   {
     "job_title": "string",

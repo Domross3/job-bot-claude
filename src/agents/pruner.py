@@ -20,7 +20,9 @@ class PrunerAgent(BaseAgent):
     def _build_prompt(self, state: PipelineState) -> str:
         # In overflow mode, prune from pruned_sections (re-prune)
         # In standard mode, prune from mapped_sections (initial prune)
-        if state.overflow_pages is not None and state.pruned_sections:
+        if state.force_source_project_inventory and state.pruned_sections:
+            source = state.pruned_sections
+        elif state.overflow_pages is not None and state.pruned_sections:
             source = state.pruned_sections
         elif state.mapped_sections:
             source = state.mapped_sections
@@ -48,6 +50,24 @@ class PrunerAgent(BaseAgent):
             f"{sections_json}\n"
             "=== END RESUME DRAFT ==="
         ]
+
+        if state.pruner_feedback:
+            feedback_lines = "\n".join(f"- {item}" for item in state.pruner_feedback)
+            parts.append(
+                "\n\n=== PROGRAMMATIC REJECTION FEEDBACK (you MUST fix every item) ===\n"
+                f"{feedback_lines}\n"
+                "=== END PROGRAMMATIC REJECTION FEEDBACK ==="
+            )
+
+        if state.force_source_project_inventory and state.source_projects:
+            source_projects_json = (
+                "[" + ", ".join(p.model_dump_json() for p in state.source_projects) + "]"
+            )
+            parts.append(
+                "\n\n=== SOURCE PROJECT INVENTORY (ALL OF THESE MUST REMAIN) ===\n"
+                f"{source_projects_json}\n"
+                "=== END SOURCE PROJECT INVENTORY ==="
+            )
 
         # Inject overflow feedback for aggressive cutting
         if state.overflow_pages is not None:

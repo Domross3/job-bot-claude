@@ -74,6 +74,7 @@ def _sanitize_text(text: str) -> str:
 def _build_styles() -> dict[str, ParagraphStyle]:
     """Paragraph styles optimized for single-page density."""
     base = getSampleStyleSheet()
+    base["Normal"].leading = 14
 
     # Shared leading for title/date rows — ensures baseline alignment
     ENTRY_SIZE = 9.5
@@ -109,7 +110,7 @@ def _build_styles() -> dict[str, ParagraphStyle]:
             fontSize=10,
             leading=13,
             textColor=COLOR_HEADING,
-            spaceBefore=7,
+            spaceBefore=14,
             spaceAfter=1,
         ),
         # ── Entry title row: left column ─────────────────────────
@@ -137,21 +138,21 @@ def _build_styles() -> dict[str, ParagraphStyle]:
             parent=base["Normal"],
             fontName=FONT_ITALIC,
             fontSize=9,
-            leading=11.5,
+            leading=13,
             textColor=COLOR_BODY,
             leftIndent=0,
             spaceAfter=1,
         ),
-        # ── Bullet points ────────────────────────────────────────
+        # ── Bullet points (hanging indent: wrapped lines align under text, not bullet glyph)
         "bullet": ParagraphStyle(
             "Bullet",
             parent=base["Normal"],
             fontName=FONT_NAME,
             fontSize=9,
-            leading=11.5,
+            leading=14,
             textColor=COLOR_BODY,
-            leftIndent=11,
-            firstLineIndent=-11,
+            leftIndent=15,
+            firstLineIndent=-15,
             spaceBefore=0.5,
             spaceAfter=2.5,
         ),
@@ -161,7 +162,7 @@ def _build_styles() -> dict[str, ParagraphStyle]:
             parent=base["Normal"],
             fontName=FONT_NAME,
             fontSize=9,
-            leading=11.5,
+            leading=13,
             textColor=COLOR_BODY,
             leftIndent=4,
             spaceAfter=1.5,
@@ -192,7 +193,16 @@ class FormatterAgent:
         logger.info("▶ Running formatter agent [reportlab — no LLM call]")
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        page_count = self._build_pdf(state, str(output_path))
+        buffer = BytesIO()
+        page_count = self._build_pdf(state, buffer)
+        if page_count > 1:
+            buffer.close()
+            raise RuntimeError(
+                f"Formatter refused to write final PDF because it rendered to {page_count} pages."
+            )
+
+        output_path.write_bytes(buffer.getvalue())
+        buffer.close()
         logger.info(
             "✔ formatter agent complete — %d page(s), saved to %s",
             page_count,
@@ -239,55 +249,97 @@ class FormatterAgent:
 
     @staticmethod
     def _extract_contact(master_resume: str) -> tuple[str, str]:
-        """Extract name and contact HTML (with clickable links) from header."""
-        name = "Resume"
-        contact_line = ""
+        """Deterministic regex extraction of name and contact HTML.
+
+        Bypasses LLM entirely. Parses the raw master_resume text using
+        pure Python regex to find name, email, phone, and markdown links.
+        Handles both Markdown (# heading) and plain text (PDF) formats.
+        """
         if not master_resume:
-            return name, contact_line
+            return "Resume", ""
+
+        name = ""
+        contact_html = ""
 
         for line in master_resume.split("\n"):
             stripped = line.strip()
+            if not stripped:
+                continue
             if stripped.startswith("---"):
                 break
-            # First markdown heading → name
-            if stripped.startswith("#") and name == "Resume":
-                name = stripped.lstrip("#").strip()
+
+            # ── Name: first heading or first non-contact line ─────
+            if not name:
+                if stripped.startswith("#"):
+                    name = stripped.lstrip("#").strip()
+                elif "|" not in stripped and "@" not in stripped:
+                    name = stripped
+                # Clean: strip markdown, "— Master Resume", etc.
                 name = re.sub(r"[*_]", "", name).strip()
-                # Strip descriptors: "— Master Resume", "- Resume", etc.
                 name = re.sub(
-                    r"\s*[—–\-]\s*(Master\s+)?Resume.*$",
-                    "",
-                    name,
-                    flags=re.IGNORECASE,
+                    r"\s*[—–\-]\s*(Master\s+)?Resume.*$", "",
+                    name, flags=re.IGNORECASE,
                 ).strip()
-            # Contact info line (has | or @)
-            elif ("|" in stripped or "@" in stripped) and name != "Resume":
-                contact_line = re.sub(r"\*\*|\*|__|_", "", stripped)
+                if "|" not in stripped and "@" not in stripped:
+                    continue
 
-                # Convert markdown links → ReportLab <a> hyperlinks
-                def _link_repl(m: re.Match) -> str:
-                    text, url = m.group(1), m.group(2)
-                    if url and url != "#" and url.startswith(("http://", "https://")):
-                        return (
-                            f'<a href="{url}" color="#1A5276">'
-                            f"<u>{text}</u></a>"
+            # ── Contact: line with | or @ ─────────────────────────
+            if ("|" in stripped or "@" in stripped) and not contact_html:
+                raw = re.sub(r"\*\*|\*|__|_", "", stripped)
+                print(f"DEBUG CONTACT RAW LINE: {repr(raw)}")
+
+                # Build contact parts deterministically
+                parts: list[str] = []
+                for segment in raw.split("|"):
+                    segment = segment.strip()
+                    if not segment:
+                        continue
+                    print(f"DEBUG CONTACT SEGMENT: {repr(segment)}")
+
+                    # 1) Markdown link: [Text](URL)
+                    md_match = re.match(
+                        r'\[([^\]]+)\]\(([^)]+)\)', segment
+                    )
+                    if md_match:
+                        label, url = md_match.group(1), md_match.group(2).strip()
+                        print(f"DEBUG CONTACT MD LINK: label={repr(label)}, url={repr(url)}")
+                        if url and url != "#":
+                            # Ensure URL has a scheme
+                            if not re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", url):
+                                url = f"https://{url.lstrip('/')}"
+                            parts.append(
+                                f'<a href="{url}" color="blue"><u>{label}</u></a>'
+                            )
+                        else:
+                            # Placeholder link (#) — render as plain text
+                            parts.append(segment.replace("[", "").split("]")[0])
+                        print(f"DEBUG CONTACT RESULT: {repr(parts[-1])}")
+                        continue
+
+                    # 2) Bare email address
+                    email_match = re.match(
+                        r"([\w.+-]+@[\w-]+\.[\w.-]+)$", segment
+                    )
+                    if email_match:
+                        email = email_match.group(1)
+                        parts.append(
+                            f'<a href="mailto:{email}" color="blue">'
+                            f"<u>{email}</u></a>"
                         )
-                    return text
+                        print(f"DEBUG CONTACT EMAIL: {repr(parts[-1])}")
+                        continue
 
-                contact_line = re.sub(
-                    r"\[([^\]]+)\]\(([^)]*)\)", _link_repl, contact_line
-                )
+                    # 3) Plain text (city, phone, etc.)
+                    parts.append(segment)
+                    print(f"DEBUG CONTACT PLAIN: {repr(segment)}")
 
-                # Make bare email addresses clickable
-                contact_line = re.sub(
-                    r"([\w.+-]+@[\w-]+\.[\w.-]+)",
-                    r'<a href="mailto:\1" color="#1A5276">\1</a>',
-                    contact_line,
-                )
+                contact_html = "  |  ".join(parts)
+                print(f"DEBUG CONTACT FINAL HTML: {repr(contact_html)}")
 
-                contact_line = contact_line.strip()
+            if name and contact_html:
+                break
 
-        return name, contact_line
+        return name or "Resume", contact_html
 
     # ── Section builder ──────────────────────────────────────────
 
@@ -304,7 +356,7 @@ class FormatterAgent:
                 width="100%",
                 thickness=0.5,
                 color=COLOR_RULE,
-                spaceAfter=3,
+                spaceAfter=6,
                 spaceBefore=0,
             )
         )
@@ -340,11 +392,17 @@ class FormatterAgent:
         tbl = self._make_entry_row(org_para, dates_para, space_before=4)
         elements.append(tbl)
 
-        # Line 2: Degree / title
+        # Line 2: Degree / title — hardcoded abbreviation for long college names
         if entry.title:
+            edu_title = entry.title.replace(
+                "College of Literature, Science, and the Arts",
+                "College of LSA",
+            )
+            print(f"DEBUG EDU TITLE BEFORE: {repr(entry.title)}")
+            print(f"DEBUG EDU TITLE AFTER:  {repr(edu_title)}")
             elements.append(
                 Paragraph(
-                    _sanitize_text(self._esc(entry.title)),
+                    _sanitize_text(self._esc(edu_title)),
                     self.styles["edu_degree"],
                 )
             )
@@ -392,6 +450,7 @@ class FormatterAgent:
         elements: list = []
         for bullet in entry.bullets:
             text = _sanitize_text(bullet)
+            text = " ".join(text.split())
             if ":" in text:
                 cat, items = text.split(":", 1)
                 markup = f"<b>{self._esc(cat.strip())}:</b> {self._esc(items.strip())}"
@@ -422,7 +481,11 @@ class FormatterAgent:
 
     def _make_bullet(self, text: str) -> Paragraph:
         """Create a single bullet-point paragraph."""
-        clean = _sanitize_text(text)
+        # Strip <br> tags, literal \n strings, and all extra whitespace
+        clean = re.sub(r'<br\s*/?>', ' ', text, flags=re.IGNORECASE)
+        clean = clean.replace('\\n', ' ').replace('\n', ' ')
+        clean = " ".join(clean.split())
+        clean = _sanitize_text(clean)
         markup = (
             f'<font color="{COLOR_BULLET.hexval()}">\u2022</font>'
             f"  {self._esc(clean)}"

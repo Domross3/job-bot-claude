@@ -76,6 +76,18 @@ class PipelineState(BaseModel):
     pruned_sections: list[ResumeSection] | None = None
     evaluation: Evaluation | None = None
     final_resume: str | None = None
+    source_projects: list[ResumeEntry] = Field(
+        default_factory=list,
+        description="Project entries deterministically parsed from the source master resume",
+    )
+    pruner_feedback: list[str] = Field(
+        default_factory=list,
+        description="Programmatic guardrail feedback injected into the Pruner prompt",
+    )
+    force_source_project_inventory: bool = Field(
+        default=False,
+        description="When true, Pruner receives the source project inventory to restore missing projects",
+    )
 
     # ── Pipeline metadata ───────────────────────────────────────
     revision_count: int = 0
@@ -89,6 +101,10 @@ class PipelineState(BaseModel):
     overflow_pages: float | None = Field(
         default=None,
         description="Set by Formatter test render — e.g. 1.3 means 30% over 1 page",
+    )
+    last_render_page_count: int | None = Field(
+        default=None,
+        description="Most recent page count observed during formatter test render",
     )
     render_iteration: int = 0
     max_render_iterations: int = 3

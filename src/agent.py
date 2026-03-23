@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -32,6 +33,14 @@ class AgentConfig:
     temperature: float
     max_tokens: int
     system_prompt: str
+
+
+@dataclass(frozen=True)
+class TaggedResponse:
+    """Structured view of a tagged LLM response."""
+
+    thinking: str
+    answer: str
 
 
 def load_agent_config(agent_name: str) -> AgentConfig:
@@ -95,7 +104,15 @@ class BaseAgent(ABC):
         logger.info("▶ Running %s agent [%s]", self.config.name, self.config.model)
         user_message = self._build_prompt(state)
         raw_response = self._call_llm(user_message)
-        updated_state = self._parse_and_update(state, raw_response)
+        tagged = self._extract_tagged_response(raw_response)
+        if tagged.thinking:
+            logger.info("%s reasoning summary:\n%s", self.config.name, tagged.thinking)
+            print(
+                f"\n  [{self.config.name} reasoning summary]\n"
+                f"  {tagged.thinking.replace(chr(10), chr(10) + '  ')}"
+            )
+        parseable_response = tagged.answer or raw_response
+        updated_state = self._parse_and_update(state, parseable_response)
         logger.info("✔ %s agent complete", self.config.name)
         return updated_state
 
@@ -105,14 +122,39 @@ class BaseAgent(ABC):
         """Call Anthropic API with exponential backoff (max 3 retries)."""
         max_retries = 3
         try:
+            request_kwargs = {
+                "model": self.config.model,
+                "max_tokens": self.config.max_tokens,
+                "temperature": self.config.temperature,
+                "system": self.config.system_prompt,
+                "messages": [{"role": "user", "content": user_message}],
+            }
+            # NOTE: Adaptive thinking (API-level) is NOT used. We rely on
+            # prompt-level <thinking>/<answer> tags instead, which work on
+            # all models including Haiku. The tag extraction in run() handles
+            # parsing the response.
+
             response = self.client.messages.create(
-                model=self.config.model,
-                max_tokens=self.config.max_tokens,
-                temperature=self.config.temperature,
-                system=self.config.system_prompt,
-                messages=[{"role": "user", "content": user_message}],
+                **request_kwargs,
             )
-            text = response.content[0].text
+            text_parts: list[str] = []
+            for block in response.content:
+                block_type = getattr(block, "type", "")
+                if block_type == "text":
+                    text_parts.append(block.text)
+                elif block_type == "thinking":
+                    logger.debug(
+                        "%s returned an internal thinking block (%d chars)",
+                        self.config.name,
+                        len(getattr(block, "thinking", "")),
+                    )
+                elif block_type == "redacted_thinking":
+                    logger.debug(
+                        "%s returned a redacted thinking block",
+                        self.config.name,
+                    )
+
+            text = "\n".join(part for part in text_parts if part).strip()
             logger.debug(
                 "%s token usage: input=%d output=%d",
                 self.config.name,
@@ -155,7 +197,7 @@ class BaseAgent(ABC):
     @staticmethod
     def _extract_json(raw: str) -> str:
         """Strip markdown code fences if the LLM wraps its JSON output."""
-        text = raw.strip()
+        text = BaseAgent._extract_tagged_response(raw).answer or raw.strip()
         if text.startswith("```"):
             # Remove opening fence (```json or ```)
             first_newline = text.index("\n")
@@ -163,6 +205,36 @@ class BaseAgent(ABC):
         if text.endswith("```"):
             text = text[: -len("```")]
         return text.strip()
+
+    @staticmethod
+    def _extract_tagged_response(raw: str) -> TaggedResponse:
+        """Return visible thinking summary and answer payload from a tagged response."""
+        text = raw.strip()
+        thinking_match = re.search(
+            r"<thinking>\s*(.*?)\s*</thinking>",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        answer_match = re.search(
+            r"<answer>\s*(.*?)\s*</answer>",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        thinking = thinking_match.group(1).strip() if thinking_match else ""
+        if answer_match:
+            answer = answer_match.group(1).strip()
+        elif thinking_match:
+            answer = re.sub(
+                r"<thinking>\s*.*?\s*</thinking>",
+                "",
+                text,
+                flags=re.IGNORECASE | re.DOTALL,
+            ).strip()
+        else:
+            answer = text
+
+        return TaggedResponse(thinking=thinking, answer=answer)
 
     def _parse_json(self, raw: str) -> Any:
         """Parse JSON from LLM output, with one retry on failure."""
@@ -176,10 +248,11 @@ class BaseAgent(ABC):
                 e,
             )
             fix_prompt = (
-                "Your previous response was not valid JSON. "
+                "Your previous <answer> block was not valid JSON. "
                 "Here is the error:\n\n"
                 f"{e}\n\n"
-                "Please return ONLY the corrected JSON with no extra text."
+                "Return an optional brief <thinking> summary plus the corrected "
+                "JSON entirely inside <answer> tags."
             )
             retry_raw = self._call_llm(fix_prompt)
             cleaned = self._extract_json(retry_raw)

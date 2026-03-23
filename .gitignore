@@ -1,6 +1,6 @@
 # User inputs (may contain PII)
-inputs/master_resume.md
-inputs/job_description.md
+inputs/master_resume.*
+inputs/job_description.*
 
 # Pipeline outputs
 outputs/
