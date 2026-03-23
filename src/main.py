@@ -37,7 +37,7 @@ def main() -> None:
         "--output",
         type=Path,
         default=None,
-        help="Output file path (default: outputs/tailored_YYYYMMDD_HHMMSS.md)",
+        help="Output file path (default: outputs/tailored_YYYYMMDD_HHMMSS.docx)",
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -76,7 +76,7 @@ def main() -> None:
     output_path = args.output
     if output_path is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = OUTPUTS_DIR / f"tailored_{timestamp}.md"
+        output_path = OUTPUTS_DIR / f"tailored_{timestamp}.docx"
 
     # ── Run pipeline ─────────────────────────────────────────────
     print("\n🚀 Starting resume tailoring pipeline...\n")
@@ -85,6 +85,7 @@ def main() -> None:
 
     if state.final_resume:
         print("\n✔  Pipeline complete!")
+        print(f"   Open with: open \"{output_path}\"")
     else:
         print("\n⚠  Pipeline finished without producing a final resume.")
 

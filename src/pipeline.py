@@ -68,14 +68,12 @@ class Pipeline:
             print("\n✖  Pipeline aborted by user.")
             return state
 
-        # ── Step 5: Format ───────────────────────────────────────
-        state = self.formatter.run(state)
-
-        # ── Write output ─────────────────────────────────────────
+        # ── Step 5: Format → DOCX ────────────────────────────────
         if output_path:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_text(state.final_resume or "", encoding="utf-8")
+            state = self.formatter.run(state, output_path)
             print(f"\n✔  Resume written to {output_path}")
+        else:
+            print("\n⚠  No output path specified — skipping DOCX generation.")
 
         return state
 

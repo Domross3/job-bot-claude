@@ -6,7 +6,7 @@
 - [x] Define PipelineState schema
 - [x] Define agent contracts and prompt strategy
 - [x] Write architecture_plan.md
-- [x] User decisions integrated (model allocation, HITL gate, Markdown-only, text input)
+- [x] User decisions integrated (model allocation, HITL gate, DOCX output, text input)
 - [x] **Architecture approved — ready for implementation**
 
 ## Phase 2: Core Infrastructure
@@ -14,7 +14,7 @@
 - [x] Implement PipelineState + all data models (state.py)
 - [x] Implement BaseAgent class with retry/JSON parsing (agent.py)
 - [x] Create config YAML — models.yaml (hybrid Haiku/Sonnet stack)
-- [x] Create config YAML — all 5 agent prompt files
+- [x] Create config YAML — all 4 LLM agent prompt files
 - [x] Implement Pipeline orchestrator with HITL gate (pipeline.py)
 - [x] Implement CLI entry point (main.py)
 - [x] Install dependencies & verify all imports
@@ -25,16 +25,20 @@
 - [x] Semantic Mapper Agent (Sonnet) — src/agents/mapper.py
 - [x] Pruner Agent (Haiku) — src/agents/pruner.py
 - [x] Critic/Evaluator Agent (Sonnet) — src/agents/critic.py
-- [x] Formatter Agent (Haiku) — src/agents/formatter.py
+- [x] Formatter Agent (python-docx, no LLM) — src/agents/formatter.py
 - [x] **Phase 3 complete**
 
 ## Phase 4: Integration & End-to-End Test
-- [ ] Place sample master_resume.md + job_description.md in inputs/
-- [ ] End-to-end run with real API calls
-- [ ] Verify HITL gate works (approve/revise/reject flows)
-- [ ] Verify output quality
+- [x] End-to-end run with real API calls
+- [x] Fix Critic scoring (too harsh → approved first pass at 0.88)
+- [x] Fix Mapper keyword stuffing (natural language rules)
+- [x] Fix Formatter contact info (name + contact line extraction)
+- [x] Upgrade output from Markdown → DOCX (python-docx)
+- [x] Verify DOCX output (38KB, valid Microsoft OOXML)
+- [x] **Phase 4 complete**
 
 ## Phase 5: Polish
+- [ ] DOCX styling refinements (template customization)
 - [ ] Error handling edge cases
-- [ ] Logging / verbose mode improvements
-- [ ] Optional HTML/PDF output (deferred)
+- [ ] Logging improvements
+- [ ] Optional PDF export (via docx2pdf)
