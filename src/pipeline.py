@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 from .agents import (
@@ -12,9 +13,31 @@ from .agents import (
     MapperAgent,
     PrunerAgent,
 )
-from .state import PipelineState
+from .state import Evaluation, PipelineState
 
 logger = logging.getLogger(__name__)
+
+# ── Regex for extracting numbers (handles negatives, decimals, comma groups) ──
+_NUMBER_RE = re.compile(r"-?\d+(?:,\d{3})*(?:\.\d+)?")
+
+
+def _extract_numbers(text: str) -> set[str]:
+    """Extract all numeric tokens from text, normalized (commas stripped)."""
+    raw = _NUMBER_RE.findall(text)
+    return {n.replace(",", "") for n in raw}
+
+
+def _sections_to_text(sections) -> str:
+    """Serialize all resume section content to plain text for number extraction."""
+    parts: list[str] = []
+    for section in sections:
+        parts.append(section.heading)
+        for entry in section.entries:
+            parts.append(entry.title)
+            parts.append(entry.organization)
+            parts.append(entry.dates)
+            parts.extend(entry.bullets)
+    return "\n".join(parts)
 
 
 class Pipeline:
@@ -94,11 +117,88 @@ class Pipeline:
     # ── Internal helpers ─────────────────────────────────────────
 
     def _run_core_loop(self, state: PipelineState) -> PipelineState:
-        """Run Mapper → Pruner → Critic once."""
-        state = self.mapper.run(state)
-        state = self.pruner.run(state)
+        """Run Mapper → Pruner → [Number Parity Check] → Critic.
+
+        The number parity check is a deterministic regex gate that catches
+        fabricated/altered numbers BEFORE the expensive Critic LLM call.
+        If it fails, the Mapper is re-invoked with feedback (max 2 retries).
+        """
+        max_parity_retries = 2
+
+        for attempt in range(max_parity_retries + 1):
+            state = self.mapper.run(state)
+            state = self.pruner.run(state)
+
+            # ── Programmatic number parity gate ──────────────────
+            drift_issues = self._check_number_parity(state)
+
+            if not drift_issues:
+                logger.info("  ✔ Number parity check passed")
+                break  # Clean — proceed to Critic
+
+            # Drift detected — log, inject feedback, retry Mapper
+            logger.warning(
+                "  ✖ Number parity check FAILED (attempt %d/%d): %s",
+                attempt + 1,
+                max_parity_retries + 1,
+                drift_issues,
+            )
+            print(f"\n  ✖  Number parity check failed (attempt {attempt + 1}):")
+            for issue in drift_issues:
+                print(f"     • {issue}")
+
+            if attempt < max_parity_retries:
+                # Inject synthetic evaluation so Mapper sees the feedback
+                synthetic_eval = Evaluation(
+                    approved=False,
+                    factual_drift_issues=drift_issues,
+                    missing_keywords=[],
+                    suggestions=[
+                        "CRITICAL: Restore ALL original numbers exactly as they "
+                        "appear in the Master Resume. Do not combine, round, or "
+                        "alter any numerical values."
+                    ],
+                    overall_score=0.0,
+                )
+                state = state.model_copy(update={"evaluation": synthetic_eval})
+                print("     → Re-running Mapper with correction feedback...")
+            else:
+                print("     → Max retries exhausted. Proceeding to Critic.")
+
+        # ── Run Critic on the (hopefully clean) draft ────────────
         state = self.critic.run(state)
         return state
+
+    @staticmethod
+    def _check_number_parity(state: PipelineState) -> list[str]:
+        """Compare numbers in pruned_sections against master_resume.
+
+        Returns a list of drift issue descriptions (empty = clean).
+        """
+        if not state.pruned_sections:
+            return []
+
+        source_numbers = _extract_numbers(state.master_resume)
+        draft_text = _sections_to_text(state.pruned_sections)
+        draft_numbers = _extract_numbers(draft_text)
+
+        # Numbers in draft that don't exist anywhere in the source
+        phantom_numbers = draft_numbers - source_numbers
+
+        # Filter out trivially safe numbers (single digits 0-9 are too
+        # common in dates, list counts, etc. to be meaningful signals)
+        phantom_numbers = {n for n in phantom_numbers if len(n) > 1 or int(n) < 0}
+
+        issues: list[str] = []
+        for num in sorted(phantom_numbers):
+            # Try to find the closest source number for a helpful message
+            issues.append(
+                f"Number '{num}' found in draft but does not exist in the "
+                f"Master Resume. Source numbers include: "
+                f"{sorted(source_numbers)[:10]}"
+            )
+
+        return issues
 
     def _render_and_refine(self, state: PipelineState) -> PipelineState:
         """Test render → if overflow → re-prune → repeat (max iterations).

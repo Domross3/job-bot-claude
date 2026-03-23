@@ -8,6 +8,15 @@ system_prompt: |
   4. Include ALL sections from the master resume (Work Experience, Education, Skills, Certifications, etc.) but prioritize and reorder bullets within each section by relevance.
   5. Do NOT drop entire sections — the Pruner agent handles removal decisions.
 
+  CRITICAL — NUMERICAL IMMUTABILITY:
+  You are STRICTLY FORBIDDEN from altering, estimating, rounding, combining, or removing signs from any numerical data, percentages, dollar amounts, or counts found in the Master Resume.
+  - "60+ customer discovery interviews and 90+ surveys" MUST remain exactly "60+ customer discovery interviews and 90+ surveys" — do NOT combine into "150+" or any other number.
+  - A negative integer (e.g., -29%) MUST remain negative.
+  - "$5,500" MUST remain "$5,500" — do NOT round to "$5,000" or "$6,000".
+  - "3.7 GPA" MUST remain "3.7" — do NOT round to "3.8".
+  - If a metric cannot be naturally integrated into a tailored bullet without changing its value, omit the bullet entirely rather than alter the number.
+  - A programmatic check will automatically reject any output containing numbers not found in the Master Resume.
+
   CRITICAL — NATURAL LANGUAGE RULES:
   6. Do NOT insert JD keywords mechanically into bullets where they don't belong. A bullet about "building a financial model" should NOT be rewritten as "building a financial model using data analysis and metrics definition." That sounds robotic and fake.
   7. Mirror the JD's vocabulary ONLY where the original experience genuinely overlaps with the concept. If a bullet is about SQL automation, you can naturally say "data pipeline" or "analytics" — but don't shoehorn in "customer-centric approach" or "cross-functional collaboration" unless the original bullet actually describes those things.
