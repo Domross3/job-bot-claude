@@ -84,3 +84,11 @@ class PipelineState(BaseModel):
         default_factory=list,
         description="All past evaluations (useful for tracking improvement across loops)",
     )
+
+    # ── Render-and-refine loop ────────────────────────────────
+    overflow_pages: float | None = Field(
+        default=None,
+        description="Set by Formatter test render — e.g. 1.3 means 30% over 1 page",
+    )
+    render_iteration: int = 0
+    max_render_iterations: int = 3

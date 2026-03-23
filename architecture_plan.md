@@ -66,40 +66,42 @@
      │     Agent         │  Writes: evaluation {approved: bool, issues: [...]}
      └────────┬──────────┘
               │
-         ┌────┴────┐
-         │Approved?│
-         └────┬────┘
-          No ──┤── Yes
-              │       │
-     ┌────────▼──┐    │
-     │ Re-run     │    │
-     │ Mapper →   │    │
-     │ Pruner →   │    │
-     │ Critic     │    │
-     │ (max 2x)   │    │
-     └────────────┘    │
-                       │
-              ┌────────▼─────────┐
-              │  HUMAN-IN-THE-   │  Pipeline HALTS here.
-              │  LOOP GATE       │  User reviews Critic evaluation
-              │                  │  + drafted resume preview.
-              │  Actions:        │
-              │   [approve] →    │  Proceed to Formatter
-              │   [reject]  →    │  Exit with feedback
-              │   [revise]  →    │  Re-enter Mapper loop
-              └────────┬─────────┘
-                       │ (approved)
-              ┌────────▼─────────┐
-              │  5. FORMATTER    │  Reads: pruned_sections + contact header
-              │  (reportlab)    │  Writes: polished .pdf file
-              │  No LLM call    │  Programmatic rendering: flush-right dates,
-              │                 │  clickable hyperlinks, professional layout
-              └────────┬─────────┘
-                       │
-                       ▼
-              ┌─────────────────┐
-              │  Output: .pdf   │
-              └─────────────────┘
+     ┌────────▼──────────────────────────┐
+     │  5. RENDER-AND-REFINE LOOP        │
+     │                                   │
+     │  Formatter.test_render(state)     │
+     │       ↓                           │
+     │  Pages == 1? ──→ proceed          │
+     │       ↓ (overflow)                │
+     │  Inject overflow_pages into state │
+     │  Re-run Pruner (aggressive mode)  │
+     │  Loop back to test_render         │
+     │       (max 3 iterations)          │
+     └────────┬──────────────────────────┘
+              │ (1-page confirmed)
+              │
+     ┌────────▼──────────┐
+     │  HUMAN-IN-THE-    │  Pipeline HALTS here.
+     │  LOOP GATE        │  User reviews Critic evaluation
+     │                   │  + 1-page draft preview.
+     │  Actions:         │
+     │   [approve] →     │  Save final PDF
+     │   [reject]  →     │  Exit with feedback
+     │   [revise]  →     │  Re-enter Mapper loop
+     └────────┬──────────┘
+              │ (approved)
+     ┌────────▼──────────┐
+     │  6. FORMATTER     │  Reads: pruned_sections + contact header
+     │  (reportlab)      │  Writes: polished single-page .pdf
+     │  No LLM call      │  Flush-right dates, clickable hyperlinks,
+     │                   │  education hierarchy, text sanitization
+     └────────┬──────────┘
+              │
+              ▼
+     ┌─────────────────┐
+     │  Output: .pdf   │
+     │  (exactly 1 pg) │
+     └─────────────────┘
 ```
 
 ## Project Structure
@@ -212,19 +214,29 @@ Key design choices:
 | **Critic** | `pruned_sections` + `master_resume` + `analysis` | Compare each bullet to its source for factual drift. Check keyword coverage against `analysis.hard_skills`. Flag issues or approve. | `Evaluation` JSON |
 | **Formatter** | `pruned_sections` (approved) + contact header from `master_resume` | **No LLM call.** Programmatically renders a styled PDF using `reportlab` with Helvetica fonts, flush-right date alignment, clickable hyperlinks, section rules, and tight margins. | `.pdf` file |
 
+## Render-and-Refine Loop
+
+After the Critic, the pipeline enters a **closed-loop page-fit check**:
+
+1. **Test Render**: The Formatter builds the PDF to an in-memory buffer (`BytesIO`) and counts pages via a page callback.
+2. **Overflow Check**: If pages > 1, the Pruner is re-invoked with `overflow_pages` injected into state (e.g., `1.3` means 30% over). The Pruner's prompt includes aggressive condensing instructions proportional to the overflow.
+3. **Iterate**: Steps 1–2 repeat (max 3 iterations) until the content fits in exactly 1 page.
+4. **Constraint Injection**: The Mapper and Pruner prompts include spatial budgets (max bullets per role, max roles, character limits) so initial output is close to 1 page, minimizing refine iterations.
+
 ## Human-in-the-Loop Protocol
 
-The pipeline implements a **"Propose → Preview → Approve → Execute"** pattern:
+The pipeline implements a **"Propose → Render → Preview → Approve → Execute"** pattern:
 
 1. **Propose**: Agents 1–4 (Analyzer → Mapper → Pruner → Critic) run automatically.
-2. **Preview**: After the Critic completes, the pipeline halts and displays:
+2. **Render-and-Refine**: The Formatter test-renders the PDF; if it overflows, the Pruner condenses and re-renders until it fits in 1 page.
+3. **Preview**: The pipeline halts and displays:
    - The Critic's `Evaluation` (approval status, flagged issues, suggestions)
-   - A rendered preview of the current `pruned_sections` draft
-3. **Approve**: The user chooses one of three actions:
-   - `approve` — Proceed to the Formatter agent for final output
+   - A text preview of the 1-page-confirmed draft
+4. **Approve**: The user chooses one of three actions:
+   - `approve` — Save the final PDF
    - `reject` — Abort the pipeline; no output is produced
-   - `revise` — Re-enter the Mapper → Pruner → Critic loop (respects the max 2 revision cap)
-4. **Execute**: Only after human approval does the Formatter agent produce the final `.pdf` file.
+   - `revise` — Re-enter the full Mapper → Pruner → Critic → Render loop
+5. **Execute**: Only after human approval does the Formatter save the final `.pdf` file.
 
 This gate is implemented in `pipeline.py` as a blocking input prompt during CLI execution.
 

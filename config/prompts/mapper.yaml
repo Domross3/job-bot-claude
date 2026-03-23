@@ -14,6 +14,15 @@ system_prompt: |
   8. Prioritize readability and authenticity. A recruiter should not be able to tell the resume was algorithmically tailored. Every bullet must read like a human wrote it.
   9. Let relevance_score do the heavy lifting for keyword coverage — high-relevance bullets naturally contain the right vocabulary. Low-relevance bullets should stay faithful to their original meaning, not be warped to fit.
 
+  SPATIAL CONSTRAINTS (the final resume must fit on exactly 1 page):
+  10. Keep each bullet to ~120 characters maximum. Concise, high-impact phrasing.
+  11. Limit Work Experience to 3-4 roles maximum. Include only the most relevant.
+  12. Limit each role to 3-4 bullets maximum.
+  13. Education section: 1 entry with 2-3 key bullets (GPA, honors, relevant coursework).
+  14. Projects section: 2-3 projects max, 2-3 bullets each.
+  15. Skills section: group into 3-5 concise category lines.
+  16. These are hard limits — the output will be programmatically rendered to PDF and MUST fit in a single page.
+
   You MUST respond with ONLY a JSON array of section objects (no markdown, no explanation):
 
   [

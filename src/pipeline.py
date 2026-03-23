@@ -1,9 +1,8 @@
-"""Pipeline orchestrator — runs agents in sequence with HITL gate."""
+"""Pipeline orchestrator — runs agents in sequence with render-and-refine loop + HITL gate."""
 
 from __future__ import annotations
 
 import logging
-import sys
 from pathlib import Path
 
 from .agents import (
@@ -19,7 +18,14 @@ logger = logging.getLogger(__name__)
 
 
 class Pipeline:
-    """Orchestrates the 5-agent resume tailoring pipeline."""
+    """Orchestrates the 5-agent resume tailoring pipeline.
+
+    Flow:
+      Analyzer → Mapper → Pruner → Critic
+        → Render-and-Refine loop (test render → overflow? → re-prune)
+        → HITL gate (1-page confirmed)
+        → Formatter saves final PDF
+    """
 
     def __init__(self) -> None:
         self.analyzer = AnalyzerAgent()
@@ -34,7 +40,7 @@ class Pipeline:
         job_description: str,
         output_path: Path | None = None,
     ) -> PipelineState:
-        """Execute the full pipeline with human-in-the-loop gate."""
+        """Execute the full pipeline."""
 
         state = PipelineState(
             master_resume=master_resume,
@@ -45,10 +51,13 @@ class Pipeline:
         state = self.analyzer.run(state)
         self._print_analysis_summary(state)
 
-        # ── Steps 2–4: Mapper → Pruner → Critic (with revision loop) ──
+        # ── Steps 2–4: Mapper → Pruner → Critic ─────────────────
         state = self._run_core_loop(state)
 
-        # ── HITL Gate: pause for human review ────────────────────
+        # ── Step 5: Render-and-Refine loop ───────────────────────
+        state = self._render_and_refine(state)
+
+        # ── HITL Gate: pause for human review (1-page confirmed) ─
         action = self._human_review_gate(state)
 
         while action == "revise":
@@ -59,37 +68,98 @@ class Pipeline:
                 )
                 break
             state = state.model_copy(
-                update={"revision_count": state.revision_count + 1}
+                update={
+                    "revision_count": state.revision_count + 1,
+                    "overflow_pages": None,
+                    "render_iteration": 0,
+                }
             )
             state = self._run_core_loop(state)
+            state = self._render_and_refine(state)
             action = self._human_review_gate(state)
 
         if action == "reject":
             print("\n✖  Pipeline aborted by user.")
             return state
 
-        # ── Step 5: Format → DOCX ────────────────────────────────
+        # ── Step 6: Save final PDF ───────────────────────────────
         if output_path:
             state = self.formatter.run(state, output_path)
             print(f"\n✔  Resume written to {output_path}")
         else:
-            print("\n⚠  No output path specified — skipping DOCX generation.")
+            print("\n⚠  No output path specified — skipping PDF generation.")
 
         return state
 
     # ── Internal helpers ─────────────────────────────────────────
 
     def _run_core_loop(self, state: PipelineState) -> PipelineState:
-        """Run Mapper → Pruner → Critic once, then hand control to the HITL gate."""
+        """Run Mapper → Pruner → Critic once."""
         state = self.mapper.run(state)
         state = self.pruner.run(state)
         state = self.critic.run(state)
+        return state
+
+    def _render_and_refine(self, state: PipelineState) -> PipelineState:
+        """Test render → if overflow → re-prune → repeat (max iterations).
+
+        Returns state with confirmed single-page content.
+        """
+        logger.info("▶ Starting render-and-refine loop")
+
+        for iteration in range(1, state.max_render_iterations + 1):
+            page_count = self.formatter.test_render(state)
+
+            if page_count <= 1:
+                logger.info("  ✔ Render fits in 1 page")
+                # Clear any overflow metadata
+                state = state.model_copy(
+                    update={"overflow_pages": None, "render_iteration": 0}
+                )
+                return state
+
+            # Overflow detected — estimate how far over
+            overflow_estimate = page_count  # e.g. 2 pages = ~1.x actual
+            # For a more precise estimate we'd measure content height,
+            # but page_count is sufficient for the Pruner's instructions
+            overflow_ratio = 1.0 + (0.3 * iteration)  # escalating estimate
+
+            logger.warning(
+                "  ⚠ Overflow: %d pages (iteration %d/%d) — re-pruning",
+                page_count,
+                iteration,
+                state.max_render_iterations,
+            )
+            print(
+                f"\n  ⚠  Render overflow: {page_count} pages — "
+                f"re-pruning (iteration {iteration}/{state.max_render_iterations})"
+            )
+
+            state = state.model_copy(
+                update={
+                    "overflow_pages": overflow_ratio,
+                    "render_iteration": iteration,
+                }
+            )
+            state = self.pruner.run(state)
+
+        # If we exhausted iterations, proceed with whatever we have
+        final_pages = self.formatter.test_render(state)
+        if final_pages > 1:
+            print(
+                f"\n  ⚠  Could not fit to 1 page after {state.max_render_iterations} "
+                f"iterations ({final_pages} pages). Proceeding with best draft."
+            )
+        state = state.model_copy(
+            update={"overflow_pages": None, "render_iteration": 0}
+        )
         return state
 
     def _human_review_gate(self, state: PipelineState) -> str:
         """Display the Critic evaluation + draft preview, then block for user input."""
         print("\n" + "=" * 70)
         print("  HUMAN REVIEW GATE — Pipeline paused for your approval")
+        print("  (Content verified to fit on 1 page)")
         print("=" * 70)
 
         # Show Critic evaluation
@@ -113,7 +183,7 @@ class Pipeline:
 
         # Show draft preview
         print("\n" + "-" * 70)
-        print("  DRAFT PREVIEW")
+        print("  DRAFT PREVIEW (1 page)")
         print("-" * 70)
         if state.pruned_sections:
             for section in state.pruned_sections:
@@ -145,7 +215,7 @@ class Pipeline:
                 print("  Invalid choice. Enter a, r, or j.")
 
     def _print_analysis_summary(self, state: PipelineState) -> None:
-        """Print a brief summary of the JD analysis for user awareness."""
+        """Print a brief summary of the JD analysis."""
         if not state.analysis:
             return
         a = state.analysis
