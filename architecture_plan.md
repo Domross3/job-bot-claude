@@ -9,9 +9,9 @@
 | **Orchestration** | Custom pipeline (`Pipeline` class) | No framework overhead — LangGraph/CrewAI add complexity we don't need for a linear pipeline. A simple class-based state machine gives us full control and easy debugging |
 | **State** | Single `PipelineState` Pydantic model passed between agents | Type-safe, serializable, inspectable at every step |
 | **Input** | Plain text / Markdown only | No PDF/DOCX parsing — keep data pipeline simple |
-| **Output** | DOCX (Word document) | Polished, recruiter-ready output via `python-docx`. Programmatic rendering — no LLM call needed for formatting |
+| **Output** | PDF (strictly required) | Polished, submittable output via `reportlab`. Programmatic rendering — no LLM call needed for formatting |
 | **Config** | YAML files for agent prompts + model settings | Swap prompts/models without touching code |
-| **Dependencies** | `anthropic`, `pydantic`, `pyyaml`, `python-docx` | Minimal. No bloated frameworks |
+| **Dependencies** | `anthropic`, `pydantic`, `pyyaml`, `reportlab` | Minimal. No bloated frameworks, no system deps |
 
 ### Model Allocation Strategy
 
@@ -21,7 +21,7 @@
 | **Semantic Mapper** | High-capability | `claude-sonnet-4-20250514` | Deep semantic understanding required for accurate rewriting without hallucination |
 | **Pruner** | Fast / Cost-effective | `claude-haiku-4-20250514` | Rule-based conciseness task — straightforward |
 | **Critic** | High-capability | `claude-sonnet-4-20250514` | Factual drift detection demands strong reasoning |
-| **Formatter** | No LLM | `python-docx` (programmatic) | Structured data already available — pure code rendering saves cost and gives pixel-level control over styling |
+| **Formatter** | No LLM | `reportlab` (programmatic PDF) | Structured data already available — pure code rendering saves cost and gives pixel-level control over layout (flush-right dates, clickable hyperlinks) |
 
 ## Data Flow
 
@@ -91,14 +91,14 @@
                        │ (approved)
               ┌────────▼─────────┐
               │  5. FORMATTER    │  Reads: pruned_sections + contact header
-              │  (python-docx)  │  Writes: polished .docx file
-              │  No LLM call    │  Programmatic rendering with styled fonts,
-              │                 │  borders, spacing, and professional layout
+              │  (reportlab)    │  Writes: polished .pdf file
+              │  No LLM call    │  Programmatic rendering: flush-right dates,
+              │                 │  clickable hyperlinks, professional layout
               └────────┬─────────┘
                        │
                        ▼
               ┌─────────────────┐
-              │  Output: .docx  │
+              │  Output: .pdf   │
               └─────────────────┘
 ```
 
@@ -210,7 +210,7 @@ Key design choices:
 | **Mapper** | `analysis` + `master_resume` | Select and reword bullets to mirror JD vocabulary. You MUST preserve factual accuracy — change phrasing, never change facts. Every bullet must trace back to a source bullet in the master resume. | `list[ResumeSection]` JSON |
 | **Pruner** | `mapped_sections` + `analysis` | Cut filler, compress, enforce action-verb starts. Remove sections/bullets with low relevance scores. Target ≤ 1 page density. | `list[ResumeSection]` JSON |
 | **Critic** | `pruned_sections` + `master_resume` + `analysis` | Compare each bullet to its source for factual drift. Check keyword coverage against `analysis.hard_skills`. Flag issues or approve. | `Evaluation` JSON |
-| **Formatter** | `pruned_sections` (approved) + contact header from `master_resume` | **No LLM call.** Programmatically renders a styled DOCX using `python-docx` with Calibri fonts, section borders, bullet formatting, and tight margins. | `.docx` file |
+| **Formatter** | `pruned_sections` (approved) + contact header from `master_resume` | **No LLM call.** Programmatically renders a styled PDF using `reportlab` with Helvetica fonts, flush-right date alignment, clickable hyperlinks, section rules, and tight margins. | `.pdf` file |
 
 ## Human-in-the-Loop Protocol
 
@@ -224,7 +224,7 @@ The pipeline implements a **"Propose → Preview → Approve → Execute"** patt
    - `approve` — Proceed to the Formatter agent for final output
    - `reject` — Abort the pipeline; no output is produced
    - `revise` — Re-enter the Mapper → Pruner → Critic loop (respects the max 2 revision cap)
-4. **Execute**: Only after human approval does the Formatter agent produce the final `.docx` file.
+4. **Execute**: Only after human approval does the Formatter agent produce the final `.pdf` file.
 
 This gate is implemented in `pipeline.py` as a blocking input prompt during CLI execution.
 
@@ -233,7 +233,7 @@ This gate is implemented in `pipeline.py` as a blocking input prompt during CLI 
 1. **Swap models**: Change `model` in `config/models.yaml` per agent — Haiku/Sonnet/Opus are all configurable per-agent
 2. **Swap prompts**: Edit YAML files in `config/prompts/` — no code changes needed
 3. **Add agents**: Create a new file in `src/agents/`, register it in the pipeline's agent list
-4. **Add output formats**: Currently DOCX. Future: add PDF export (via `docx2pdf` or WeasyPrint), or Markdown fallback
+4. **Add output formats**: Currently PDF only (strictly required). Future: add DOCX or Markdown fallback if needed
 5. **Parallel execution**: Analyzer is the only agent with no resume dependency — future optimization could pre-process resume structure in parallel
 6. **Input format expansion**: Currently plain text/Markdown. Future: add PDF/DOCX parsing as a preprocessing step
 
@@ -248,7 +248,7 @@ This gate is implemented in `pipeline.py` as a blocking input prompt during CLI 
 
 | # | Decision | Rationale | Date |
 |---|----------|-----------|------|
-| 1 | DOCX output via python-docx | Polished, recruiter-ready output from day one; Formatter is purely programmatic (no LLM cost) | 2026-03-22 |
+| 1 | PDF-only output via ReportLab | Submittable, polished output with flush-right dates, clickable hyperlinks, sanitized name. Purely programmatic (no LLM cost) | 2026-03-22 |
 | 2 | Hybrid model stack (Haiku + Sonnet) | Cost-effective for simple tasks; high-capability where semantic accuracy is critical | 2026-03-22 |
 | 3 | Plain text/Markdown input only | Skip PDF/DOCX parsing to keep MVP data pipeline simple | 2026-03-22 |
 | 4 | Human-in-the-loop after Critic | "Propose, preview, approve, execute" pattern — user reviews before final formatting | 2026-03-22 |

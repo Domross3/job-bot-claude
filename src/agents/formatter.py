@@ -1,8 +1,7 @@
-"""Formatter Agent — renders the approved draft as a polished DOCX resume.
+"""Formatter Agent — renders the approved draft as a polished PDF resume.
 
-This agent is purely programmatic (no LLM call). It uses python-docx to
-generate a professionally styled Word document from the structured
-PipelineState data.
+This agent is purely programmatic (no LLM call). It uses ReportLab to
+generate a professionally styled PDF from the structured PipelineState data.
 """
 
 from __future__ import annotations
@@ -11,48 +10,164 @@ import logging
 import re
 from pathlib import Path
 
-from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml.ns import qn
-from docx.shared import Inches, Pt, RGBColor
+from reportlab.lib.colors import HexColor
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import inch
+from reportlab.platypus import (
+    HRFlowable,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
 
 from ..state import PipelineState, ResumeSection
 
 logger = logging.getLogger(__name__)
 
 # ── Style constants ──────────────────────────────────────────────
-FONT_NAME = "Calibri"
-COLOR_HEADING = RGBColor(0x1A, 0x1A, 0x1A)  # near-black
-COLOR_BODY = RGBColor(0x2D, 0x2D, 0x2D)     # dark gray
-COLOR_SUBTLE = RGBColor(0x55, 0x55, 0x55)    # medium gray
-COLOR_RULE = RGBColor(0x3B, 0x3B, 0x3B)      # dark line
+FONT_NAME = "Helvetica"
+FONT_BOLD = "Helvetica-Bold"
+FONT_ITALIC = "Helvetica-Oblique"
+COLOR_HEADING = HexColor("#1A1A1A")
+COLOR_BODY = HexColor("#2D2D2D")
+COLOR_SUBTLE = HexColor("#555555")
+COLOR_LINK = HexColor("#1A5276")
+COLOR_RULE = HexColor("#3B3B3B")
+
+PAGE_WIDTH, PAGE_HEIGHT = letter
+MARGIN_LEFT = 0.6 * inch
+MARGIN_RIGHT = 0.6 * inch
+MARGIN_TOP = 0.5 * inch
+MARGIN_BOTTOM = 0.5 * inch
+CONTENT_WIDTH = PAGE_WIDTH - MARGIN_LEFT - MARGIN_RIGHT
+
+
+# ── Reusable styles ─────────────────────────────────────────────
+
+def _build_styles() -> dict[str, ParagraphStyle]:
+    """Build all paragraph styles used in the resume."""
+    base = getSampleStyleSheet()
+    return {
+        "name": ParagraphStyle(
+            "ResumeName",
+            parent=base["Normal"],
+            fontName=FONT_BOLD,
+            fontSize=20,
+            leading=24,
+            alignment=TA_CENTER,
+            textColor=COLOR_HEADING,
+            spaceAfter=2,
+        ),
+        "contact": ParagraphStyle(
+            "ResumeContact",
+            parent=base["Normal"],
+            fontName=FONT_NAME,
+            fontSize=9,
+            leading=12,
+            alignment=TA_CENTER,
+            textColor=COLOR_SUBTLE,
+            spaceAfter=6,
+        ),
+        "section_heading": ParagraphStyle(
+            "SectionHeading",
+            parent=base["Normal"],
+            fontName=FONT_BOLD,
+            fontSize=11,
+            leading=14,
+            textColor=COLOR_HEADING,
+            spaceBefore=8,
+            spaceAfter=2,
+        ),
+        "entry_title": ParagraphStyle(
+            "EntryTitle",
+            parent=base["Normal"],
+            fontName=FONT_BOLD,
+            fontSize=10,
+            leading=13,
+            textColor=COLOR_HEADING,
+            spaceBefore=5,
+            spaceAfter=1,
+        ),
+        "entry_org": ParagraphStyle(
+            "EntryOrg",
+            parent=base["Normal"],
+            fontName=FONT_NAME,
+            fontSize=10,
+            leading=13,
+            textColor=COLOR_BODY,
+        ),
+        "entry_dates": ParagraphStyle(
+            "EntryDates",
+            parent=base["Normal"],
+            fontName=FONT_ITALIC,
+            fontSize=10,
+            leading=13,
+            textColor=COLOR_SUBTLE,
+            alignment=TA_RIGHT,
+        ),
+        "bullet": ParagraphStyle(
+            "Bullet",
+            parent=base["Normal"],
+            fontName=FONT_NAME,
+            fontSize=9.5,
+            leading=12.5,
+            textColor=COLOR_BODY,
+            leftIndent=12,
+            spaceAfter=1.5,
+        ),
+        "skills_category": ParagraphStyle(
+            "SkillsCategory",
+            parent=base["Normal"],
+            fontName=FONT_NAME,
+            fontSize=9.5,
+            leading=12.5,
+            textColor=COLOR_BODY,
+            leftIndent=8,
+            spaceAfter=1.5,
+        ),
+    }
 
 
 class FormatterAgent:
-    """Renders pruned_sections + contact info into a polished .docx file."""
+    """Renders pruned_sections + contact info into a polished PDF file."""
+
+    def __init__(self) -> None:
+        self.styles = _build_styles()
 
     def run(self, state: PipelineState, output_path: Path) -> PipelineState:
-        """Build and save the DOCX resume."""
-        logger.info("▶ Running formatter agent [python-docx — no LLM call]")
+        """Build and save the PDF resume."""
+        logger.info("▶ Running formatter agent [reportlab — no LLM call]")
 
-        doc = Document()
-        self._set_page_margins(doc, top=0.5, bottom=0.5, left=0.6, right=0.6)
-        self._set_default_font(doc)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        doc = SimpleDocTemplate(
+            str(output_path),
+            pagesize=letter,
+            leftMargin=MARGIN_LEFT,
+            rightMargin=MARGIN_RIGHT,
+            topMargin=MARGIN_TOP,
+            bottomMargin=MARGIN_BOTTOM,
+        )
+
+        story: list = []
 
         # ── Contact header ───────────────────────────────────────
         name, contact_line = self._extract_contact(state.master_resume)
-        self._add_name(doc, name)
+        story.append(Paragraph(self._escape(name), self.styles["name"]))
         if contact_line:
-            self._add_contact_line(doc, contact_line)
+            story.append(Paragraph(contact_line, self.styles["contact"]))
 
         # ── Resume sections ──────────────────────────────────────
         if state.pruned_sections:
             for section in state.pruned_sections:
-                self._add_section(doc, section)
+                story.extend(self._build_section(section))
 
-        # ── Save ─────────────────────────────────────────────────
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        doc.save(str(output_path))
+        # ── Render PDF ───────────────────────────────────────────
+        doc.build(story)
         logger.info("✔ formatter agent complete — saved to %s", output_path)
 
         return state.model_copy(update={"final_resume": str(output_path)})
@@ -61,7 +176,11 @@ class FormatterAgent:
 
     @staticmethod
     def _extract_contact(master_resume: str) -> tuple[str, str]:
-        """Pull name and contact line from the master resume header."""
+        """Pull name and contact line from the master resume header.
+
+        Returns (name, contact_html) where contact_html contains
+        clickable <a href> links for any markdown links found.
+        """
         name = "Resume"
         contact_line = ""
         if not master_resume:
@@ -71,191 +190,128 @@ class FormatterAgent:
             stripped = line.strip()
             if stripped.startswith("---"):
                 break
-            # First heading = name
+            # First heading → name
             if stripped.startswith("#") and name == "Resume":
                 name = stripped.lstrip("#").strip()
-                # Remove markdown formatting artifacts
+                # Remove markdown bold/italic
                 name = re.sub(r"[*_]", "", name).strip()
-                # Strip common suffixes like "— Master Resume", "- Resume"
-                name = re.sub(r"\s*[—–-]\s*(Master\s+)?Resume.*$", "", name, flags=re.IGNORECASE).strip()
-            # Line with | or @ = contact info
+                # Strip trailing descriptors: "— Master Resume", "- Resume", etc.
+                name = re.sub(
+                    r"\s*[—–\-]\s*(Master\s+)?Resume.*$", "", name, flags=re.IGNORECASE
+                ).strip()
+            # Line with | or @ → contact info
             elif ("|" in stripped or "@" in stripped) and name != "Resume":
-                # Strip markdown bold/italic markers and link syntax
                 contact_line = re.sub(r"\*\*|\*|__|_", "", stripped)
-                contact_line = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", contact_line)
+                # Convert markdown links [text](url) → ReportLab <a> tags
+                # Skip placeholder URLs like (#) or empty hrefs
+                def _link_replacer(m: re.Match) -> str:
+                    text, url = m.group(1), m.group(2)
+                    if url and url != "#" and url.startswith(("http://", "https://")):
+                        return f'<a href="{url}" color="#1A5276">{text}</a>'
+                    return text  # Render as plain text if URL is invalid
+
+                contact_line = re.sub(
+                    r"\[([^\]]+)\]\(([^)]*)\)",
+                    _link_replacer,
+                    contact_line,
+                )
                 contact_line = contact_line.strip()
 
         return name, contact_line
 
-    # ── Document builders ────────────────────────────────────────
+    # ── Section builders ─────────────────────────────────────────
 
-    def _add_name(self, doc: Document, name: str) -> None:
-        p = doc.add_paragraph()
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p.space_before = Pt(0)
-        p.space_after = Pt(2)
-        run = p.add_run(name)
-        run.font.name = FONT_NAME
-        run.font.size = Pt(22)
-        run.font.bold = True
-        run.font.color.rgb = COLOR_HEADING
+    def _build_section(self, section: ResumeSection) -> list:
+        """Build flowables for one resume section."""
+        elements: list = []
+        heading_text = section.heading.upper()
 
-    def _add_contact_line(self, doc: Document, contact: str) -> None:
-        p = doc.add_paragraph()
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p.space_before = Pt(0)
-        p.space_after = Pt(6)
-        run = p.add_run(contact)
-        run.font.name = FONT_NAME
-        run.font.size = Pt(9.5)
-        run.font.color.rgb = COLOR_SUBTLE
-
-    def _add_section(self, doc: Document, section: ResumeSection) -> None:
-        """Add a full resume section (heading + entries)."""
-        heading = section.heading.upper()
-
-        # ── Section heading with bottom rule ─────────────────────
-        p = doc.add_paragraph()
-        p.space_before = Pt(10)
-        p.space_after = Pt(3)
-        run = p.add_run(heading)
-        run.font.name = FONT_NAME
-        run.font.size = Pt(11)
-        run.font.bold = True
-        run.font.color.rgb = COLOR_HEADING
-        # Add a thin bottom border
-        self._add_bottom_border(p)
-
-        # ── Entries ──────────────────────────────────────────────
-        for entry in section.entries:
-            self._add_entry(doc, entry, section.heading)
-
-    def _add_entry(self, doc: Document, entry, section_heading: str) -> None:
-        """Add a single entry (role, degree, project, etc.)."""
-        is_skills = "skill" in section_heading.lower()
-
-        if is_skills:
-            # Skills: render bullets as styled lines (no title/org/dates)
-            for bullet in entry.bullets:
-                p = doc.add_paragraph()
-                p.space_before = Pt(1)
-                p.space_after = Pt(1)
-                p.paragraph_format.left_indent = Inches(0.15)
-
-                # If bullet has "Category: items" format, bold the category
-                if ":" in bullet:
-                    category, items = bullet.split(":", 1)
-                    cat_run = p.add_run(f"{category.strip()}:")
-                    cat_run.font.name = FONT_NAME
-                    cat_run.font.size = Pt(10)
-                    cat_run.font.bold = True
-                    cat_run.font.color.rgb = COLOR_BODY
-                    items_run = p.add_run(f" {items.strip()}")
-                    items_run.font.name = FONT_NAME
-                    items_run.font.size = Pt(10)
-                    items_run.font.color.rgb = COLOR_BODY
-                else:
-                    run = p.add_run(bullet)
-                    run.font.name = FONT_NAME
-                    run.font.size = Pt(10)
-                    run.font.color.rgb = COLOR_BODY
-            return
-
-        # ── Title | Organization | Dates line ────────────────────
-        p = doc.add_paragraph()
-        p.space_before = Pt(5)
-        p.space_after = Pt(1)
-
-        # Bold title
-        title_run = p.add_run(entry.title)
-        title_run.font.name = FONT_NAME
-        title_run.font.size = Pt(10.5)
-        title_run.font.bold = True
-        title_run.font.color.rgb = COLOR_HEADING
-
-        # Separator + organization
-        if entry.organization:
-            sep_run = p.add_run("  |  ")
-            sep_run.font.name = FONT_NAME
-            sep_run.font.size = Pt(10.5)
-            sep_run.font.color.rgb = COLOR_SUBTLE
-
-            org_run = p.add_run(entry.organization)
-            org_run.font.name = FONT_NAME
-            org_run.font.size = Pt(10.5)
-            org_run.font.color.rgb = COLOR_BODY
-
-        # Dates (right-aligned feel via tab — or appended)
-        if entry.dates:
-            sep_run = p.add_run("  |  ")
-            sep_run.font.name = FONT_NAME
-            sep_run.font.size = Pt(10.5)
-            sep_run.font.color.rgb = COLOR_SUBTLE
-
-            date_run = p.add_run(entry.dates)
-            date_run.font.name = FONT_NAME
-            date_run.font.size = Pt(10.5)
-            date_run.font.italic = True
-            date_run.font.color.rgb = COLOR_SUBTLE
-
-        # ── Bullet points ────────────────────────────────────────
-        for bullet in entry.bullets:
-            bp = doc.add_paragraph()
-            bp.space_before = Pt(0.5)
-            bp.space_after = Pt(0.5)
-            bp.paragraph_format.left_indent = Inches(0.25)
-            bp.paragraph_format.first_line_indent = Inches(-0.15)
-
-            # Bullet character
-            marker_run = bp.add_run("•  ")
-            marker_run.font.name = FONT_NAME
-            marker_run.font.size = Pt(10)
-            marker_run.font.color.rgb = COLOR_SUBTLE
-
-            text_run = bp.add_run(bullet)
-            text_run.font.name = FONT_NAME
-            text_run.font.size = Pt(10)
-            text_run.font.color.rgb = COLOR_BODY
-
-    # ── Low-level helpers ────────────────────────────────────────
-
-    @staticmethod
-    def _set_page_margins(
-        doc: Document, top: float, bottom: float, left: float, right: float
-    ) -> None:
-        """Set page margins in inches."""
-        for section in doc.sections:
-            section.top_margin = Inches(top)
-            section.bottom_margin = Inches(bottom)
-            section.left_margin = Inches(left)
-            section.right_margin = Inches(right)
-
-    @staticmethod
-    def _set_default_font(doc: Document) -> None:
-        """Set the document-wide default font."""
-        style = doc.styles["Normal"]
-        font = style.font
-        font.name = FONT_NAME
-        font.size = Pt(10)
-        font.color.rgb = COLOR_BODY
-        # Tight line spacing
-        style.paragraph_format.space_before = Pt(0)
-        style.paragraph_format.space_after = Pt(0)
-        style.paragraph_format.line_spacing = Pt(13)
-
-    @staticmethod
-    def _add_bottom_border(paragraph) -> None:
-        """Add a thin bottom border to a paragraph (section heading rule)."""
-        pPr = paragraph._p.get_or_add_pPr()
-        pBdr = pPr.makeelement(qn("w:pBdr"), {})
-        bottom = pBdr.makeelement(
-            qn("w:bottom"),
-            {
-                qn("w:val"): "single",
-                qn("w:sz"): "4",        # 0.5pt line
-                qn("w:space"): "1",
-                qn("w:color"): "3B3B3B",
-            },
+        # Section heading
+        elements.append(
+            Paragraph(self._escape(heading_text), self.styles["section_heading"])
         )
-        pBdr.append(bottom)
-        pPr.append(pBdr)
+        # Thin rule under heading
+        elements.append(
+            HRFlowable(
+                width="100%",
+                thickness=0.5,
+                color=COLOR_RULE,
+                spaceAfter=4,
+                spaceBefore=0,
+            )
+        )
+
+        is_skills = "skill" in section.heading.lower()
+
+        for entry in section.entries:
+            if is_skills:
+                elements.extend(self._build_skills_entry(entry))
+            else:
+                elements.extend(self._build_standard_entry(entry))
+
+        return elements
+
+    def _build_standard_entry(self, entry) -> list:
+        """Build a standard entry: title/org left, dates flush-right."""
+        elements: list = []
+
+        # ── Title | Org (left) and Dates (right) on the same line ──
+        left_parts = []
+        left_parts.append(f"<b>{self._escape(entry.title)}</b>")
+        if entry.organization:
+            left_parts.append(
+                f'<font color="#555555">  |  </font>{self._escape(entry.organization)}'
+            )
+
+        left_para = Paragraph("".join(left_parts), self.styles["entry_title"])
+        right_para = Paragraph(
+            self._escape(entry.dates) if entry.dates else "",
+            self.styles["entry_dates"],
+        )
+
+        # Two-column table: left content expands, dates hug right margin
+        col_widths = [CONTENT_WIDTH * 0.75, CONTENT_WIDTH * 0.25]
+        row = [[left_para, right_para]]
+        tbl = Table(row, colWidths=col_widths)
+        tbl.setStyle(
+            TableStyle(
+                [
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                    ("TOPPADDING", (0, 0), (-1, -1), 3),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+                ]
+            )
+        )
+        elements.append(tbl)
+
+        # ── Bullets ──────────────────────────────────────────────
+        for bullet in entry.bullets:
+            text = f'<font color="#888888">\u2022</font>  {self._escape(bullet)}'
+            elements.append(Paragraph(text, self.styles["bullet"]))
+
+        return elements
+
+    def _build_skills_entry(self, entry) -> list:
+        """Build a skills entry — category: items format."""
+        elements: list = []
+        for bullet in entry.bullets:
+            if ":" in bullet:
+                category, items = bullet.split(":", 1)
+                text = f"<b>{self._escape(category.strip())}:</b> {self._escape(items.strip())}"
+            else:
+                text = self._escape(bullet)
+            elements.append(Paragraph(text, self.styles["skills_category"]))
+        return elements
+
+    # ── Helpers ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _escape(text: str) -> str:
+        """Escape XML special characters for ReportLab Paragraph markup."""
+        return (
+            text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
