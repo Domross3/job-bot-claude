@@ -18,9 +18,23 @@ class FormatterAgent(BaseAgent):
             else "[]"
         )
 
+        # Extract the contact header from the master resume (everything before first ---)
+        contact_block = ""
+        if state.master_resume:
+            lines = state.master_resume.split("\n")
+            header_lines = []
+            for line in lines:
+                if line.strip().startswith("---"):
+                    break
+                header_lines.append(line)
+            contact_block = "\n".join(header_lines).strip()
+
         return (
             "Render the following structured resume data as a clean, "
             "professional Markdown resume.\n\n"
+            "=== CONTACT INFO (use this for the name and contact line) ===\n"
+            f"{contact_block}\n"
+            "=== END CONTACT INFO ===\n\n"
             "=== RESUME DATA (JSON) ===\n"
             f"{pruned_json}\n"
             "=== END RESUME DATA ==="

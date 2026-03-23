@@ -2,7 +2,7 @@
 # Change model IDs here to swap models without touching code.
 
 analyzer:
-  model: "claude-haiku-4-20250514"
+  model: "claude-haiku-4-5-20251001"
   temperature: 0.0
   max_tokens: 4096
 
@@ -12,7 +12,7 @@ mapper:
   max_tokens: 8192
 
 pruner:
-  model: "claude-haiku-4-20250514"
+  model: "claude-haiku-4-5-20251001"
   temperature: 0.0
   max_tokens: 8192
 
@@ -22,6 +22,6 @@ critic:
   max_tokens: 4096
 
 formatter:
-  model: "claude-haiku-4-20250514"
+  model: "claude-haiku-4-5-20251001"
   temperature: 0.0
   max_tokens: 8192

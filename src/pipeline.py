@@ -82,30 +82,10 @@ class Pipeline:
     # ── Internal helpers ─────────────────────────────────────────
 
     def _run_core_loop(self, state: PipelineState) -> PipelineState:
-        """Run Mapper → Pruner → Critic, with automatic retry if Critic rejects."""
+        """Run Mapper → Pruner → Critic once, then hand control to the HITL gate."""
         state = self.mapper.run(state)
         state = self.pruner.run(state)
         state = self.critic.run(state)
-
-        # Auto-retry loop (up to max_revisions) if Critic rejects
-        while (
-            state.evaluation
-            and not state.evaluation.approved
-            and state.revision_count < state.max_revisions
-        ):
-            logger.info(
-                "Critic rejected (score: %.2f) — auto-revising (%d/%d)",
-                state.evaluation.overall_score,
-                state.revision_count + 1,
-                state.max_revisions,
-            )
-            state = state.model_copy(
-                update={"revision_count": state.revision_count + 1}
-            )
-            state = self.mapper.run(state)
-            state = self.pruner.run(state)
-            state = self.critic.run(state)
-
         return state
 
     def _human_review_gate(self, state: PipelineState) -> str:
