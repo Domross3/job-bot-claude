@@ -114,6 +114,8 @@ def _extract_pdf_text(path: Path) -> str:
         for page_num in range(len(doc)):
             page = doc[page_num]
             page_text = _extract_page_blocks(page)
+            # Reconstruct hyperlinks from PDF annotations on this page
+            page_text = _restore_pdf_links(page, page_text)
             if page_text.strip():
                 pages_text.append(page_text.strip())
     finally:
@@ -139,6 +141,56 @@ def _extract_pdf_text(path: Path) -> str:
         len(full_text),
     )
     return full_text
+
+
+def _restore_pdf_links(page, text: str) -> str:
+    """Reconstruct markdown-style links from PDF hyperlink annotations.
+
+    PyMuPDF's get_text() strips hyperlink URLs, leaving only the visible
+    label text (e.g., "LinkedIn" instead of "[LinkedIn](https://...)").
+    This function reads the page's link annotations, finds the display
+    text at each link's bounding box, and replaces the plain text with
+    a markdown link so the downstream formatter can render it as a
+    clickable <a href>.
+    """
+    try:
+        links = page.get_links()
+    except Exception:
+        return text
+
+    if not links:
+        return text
+
+    # Collect (label, url) pairs — only URI links with real URLs
+    restorations: list[tuple[str, str]] = []
+    for link in links:
+        if link.get("kind") != 2:  # kind 2 = URI link
+            continue
+        uri = link.get("uri", "").strip()
+        if not uri:
+            continue
+        # Extract the display text at this link's bounding box
+        rect = link.get("from")
+        if rect is None:
+            continue
+        try:
+            label = page.get_text("text", clip=rect).strip()
+        except Exception:
+            continue
+        if label:
+            restorations.append((label, uri))
+
+    # Apply restorations — replace plain label with [label](url)
+    # Process longest labels first to avoid partial matches
+    restorations.sort(key=lambda pair: len(pair[0]), reverse=True)
+    for label, uri in restorations:
+        md_link = f"[{label}]({uri})"
+        # Only replace standalone occurrences (not already inside markdown links)
+        if f"[{label}](" not in text:
+            text = text.replace(label, md_link, 1)
+            logger.debug("Restored PDF link: %s → %s", label, md_link)
+
+    return text
 
 
 def _extract_page_blocks(page) -> str:
