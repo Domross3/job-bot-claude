@@ -1,0 +1,27 @@
+# Model configuration per agent.
+# Change model IDs here to swap models without touching code.
+
+analyzer:
+  model: "claude-haiku-4-20250514"
+  temperature: 0.0
+  max_tokens: 4096
+
+mapper:
+  model: "claude-sonnet-4-20250514"
+  temperature: 0.3
+  max_tokens: 8192
+
+pruner:
+  model: "claude-haiku-4-20250514"
+  temperature: 0.0
+  max_tokens: 8192
+
+critic:
+  model: "claude-sonnet-4-20250514"
+  temperature: 0.0
+  max_tokens: 4096
+
+formatter:
+  model: "claude-haiku-4-20250514"
+  temperature: 0.0
+  max_tokens: 8192

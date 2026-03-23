@@ -1,0 +1,30 @@
+# User inputs (may contain PII)
+inputs/master_resume.md
+inputs/job_description.md
+
+# Pipeline outputs
+outputs/
+
+# API keys / secrets
+.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Claude Code (session-specific settings)
+.claude/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
