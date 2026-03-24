@@ -21,6 +21,7 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
+from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.platypus import (
     HRFlowable,
     Paragraph,
@@ -151,10 +152,10 @@ def _build_styles() -> dict[str, ParagraphStyle]:
             fontSize=9,
             leading=14,
             textColor=COLOR_BODY,
-            leftIndent=15,
-            firstLineIndent=-15,
+            leftIndent=10,
+            firstLineIndent=-10,
             spaceBefore=0.5,
-            spaceAfter=2.5,
+            spaceAfter=2,
         ),
         # ── Skills lines ─────────────────────────────────────────
         "skills": ParagraphStyle(
@@ -480,17 +481,47 @@ class FormatterAgent:
         return tbl
 
     def _make_bullet(self, text: str) -> Paragraph:
-        """Create a single bullet-point paragraph."""
+        """Create a single bullet-point paragraph with orphan-line detection.
+
+        If a bullet barely overflows onto a second line (< 20% fill on line 2),
+        shrink the font by 0.5pt to fit it on one line cleanly.
+        """
         # Strip <br> tags, literal \n strings, and all extra whitespace
         clean = re.sub(r'<br\s*/?>', ' ', text, flags=re.IGNORECASE)
         clean = clean.replace('\\n', ' ').replace('\n', ' ')
         clean = " ".join(clean.split())
         clean = _sanitize_text(clean)
+
+        style = self.styles["bullet"]
+        bullet_prefix = "\u2022  "
+        full_text = bullet_prefix + clean
+
+        # Measure rendered width to detect orphan lines
+        available = CONTENT_WIDTH - style.leftIndent
+        text_width = stringWidth(full_text, style.fontName, style.fontSize)
+
+        if text_width > available:
+            overflow = text_width - available
+            second_line_fill = overflow / available
+            if second_line_fill < 0.20:
+                # Orphan detected — use a slightly smaller font
+                shrunk = ParagraphStyle(
+                    "BulletShrunk",
+                    parent=style,
+                    fontSize=style.fontSize - 0.5,
+                    leading=style.leading - 0.5,
+                )
+                markup = (
+                    f'<font color="{COLOR_BULLET.hexval()}">\u2022</font>'
+                    f"  {self._esc(clean)}"
+                )
+                return Paragraph(markup, shrunk)
+
         markup = (
             f'<font color="{COLOR_BULLET.hexval()}">\u2022</font>'
             f"  {self._esc(clean)}"
         )
-        return Paragraph(markup, self.styles["bullet"])
+        return Paragraph(markup, style)
 
     @staticmethod
     def _esc(text: str) -> str:
