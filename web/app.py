@@ -186,6 +186,7 @@ def _run_pipeline_sync(run_state: RunState, resume_text: str, jd_text: str) -> N
             "run_id": run_state.run_id,
             "critic": critic_data,
         })
+        logger.info("Pipeline completed for run %s in %dms", run_state.run_id, duration_ms)
 
     except Exception as exc:
         logger.exception("Pipeline failed for run %s", run_state.run_id)
