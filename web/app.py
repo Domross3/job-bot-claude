@@ -75,10 +75,16 @@ def _cleanup_old_runs() -> None:
         del runs[rid]
 
 
-# ── Web pipeline (bypasses HITL gate) ───────────────────────────
+# ── Web pipeline (automated revision loop replaces HITL gate) ───
+
+MAX_CRITIC_REVISIONS = 2
 
 def _run_pipeline_sync(run_state: RunState, resume_text: str, jd_text: str) -> None:
-    """Run the full pipeline synchronously (called via asyncio.to_thread)."""
+    """Run the full pipeline synchronously (called via asyncio.to_thread).
+
+    Mirrors the CLI pipeline's revision loop: if the critic doesn't approve,
+    feed its suggestions back into the mapper and re-run the core loop.
+    """
     start_time = time.time()
     page_fit_attempts = 0
 
@@ -89,39 +95,65 @@ def _run_pipeline_sync(run_state: RunState, resume_text: str, jd_text: str) -> N
             source_projects=parse_source_projects(resume_text),
         )
 
+        analyzer = AnalyzerAgent()
+        mapper = MapperAgent()
+        pruner = PrunerAgent()
+        critic = CriticAgent()
+        formatter = FormatterAgent()
+
         # Step 1: Analyze
         run_state.events.append({"step": "analyzing", "detail": "Extracting requirements from job description..."})
-        analyzer = AnalyzerAgent()
         state = analyzer.run(state)
 
-        # Step 2: Map
-        run_state.events.append({"step": "mapping", "detail": "Selecting and rewriting relevant experience..."})
-        mapper = MapperAgent()
-        state = mapper.run(state)
-        state = state.model_copy(
-            update={"mapped_sections": normalize_project_sections(state.mapped_sections, state.source_projects)}
-        )
+        # Steps 2-4: Core loop with critic-driven revisions
+        for revision in range(MAX_CRITIC_REVISIONS + 1):
+            # Step 2: Map
+            detail = "Selecting and rewriting relevant experience..."
+            if revision > 0:
+                detail = f"Revision {revision}: re-mapping based on critic feedback..."
+            run_state.events.append({"step": "mapping", "detail": detail})
+            state = mapper.run(state)
+            state = state.model_copy(
+                update={"mapped_sections": normalize_project_sections(state.mapped_sections, state.source_projects)}
+            )
 
-        # Step 3: Prune
-        run_state.events.append({"step": "pruning", "detail": "Optimizing content for single-page fit..."})
-        pruner = PrunerAgent()
-        state = pruner.run(state)
-        state = state.model_copy(
-            update={
-                "pruned_sections": normalize_project_sections(
-                    state.pruned_sections, state.source_projects, max_bullets_per_project=3
+            # Step 3: Prune
+            detail = "Optimizing content for single-page fit..."
+            if revision > 0:
+                detail = f"Revision {revision}: re-pruning with critic guidance..."
+            run_state.events.append({"step": "pruning", "detail": detail})
+            state = pruner.run(state)
+            state = state.model_copy(
+                update={
+                    "pruned_sections": normalize_project_sections(
+                        state.pruned_sections, state.source_projects, max_bullets_per_project=3
+                    )
+                }
+            )
+
+            # Step 4: Critic
+            detail = "Verifying factual accuracy and quality..."
+            if revision > 0:
+                detail = f"Revision {revision}: re-evaluating improvements..."
+            run_state.events.append({"step": "reviewing", "detail": detail})
+            state = critic.run(state)
+
+            # Check if critic approved or we've exhausted revisions
+            if state.evaluation and state.evaluation.approved:
+                logger.info("Critic approved on revision %d", revision)
+                break
+
+            if revision < MAX_CRITIC_REVISIONS and state.evaluation:
+                # Feed critic's suggestions back so mapper sees them
+                logger.info(
+                    "Critic rejected (score %.2f), revision %d/%d — feeding back suggestions",
+                    state.evaluation.overall_score, revision + 1, MAX_CRITIC_REVISIONS,
                 )
-            }
-        )
-
-        # Step 4: Critic
-        run_state.events.append({"step": "reviewing", "detail": "Verifying factual accuracy..."})
-        critic = CriticAgent()
-        state = critic.run(state)
+            else:
+                logger.info("Max revisions reached or no evaluation — proceeding with best draft")
 
         # Step 5: Render-and-refine loop
         run_state.events.append({"step": "rendering", "detail": "Generating polished PDF..."})
-        formatter = FormatterAgent()
 
         for iteration in range(1, state.max_render_iterations + 1):
             page_count = formatter.test_render(state)
