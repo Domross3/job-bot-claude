@@ -233,7 +233,6 @@ class Pipeline:
     BULLET_MINIMUMS = {
         "work": 3,       # per entry
         "education": 3,  # per entry
-        "project": 2,    # per entry
     }
 
     @classmethod
@@ -250,9 +249,6 @@ class Pipeline:
             elif "education" in heading:
                 min_bullets = cls.BULLET_MINIMUMS["education"]
                 section_label = "Education"
-            elif "project" in heading:
-                min_bullets = cls.BULLET_MINIMUMS["project"]
-                section_label = "Projects"
             else:
                 continue
             for entry in section.entries:
