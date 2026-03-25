@@ -1143,10 +1143,10 @@
       function showResult(data) {
         stepperSection.classList.remove('visible');
 
-        // PDF preview + download link
-        const downloadUrl = `/download/${data.run_id || currentRunId}`;
-        btnDownload.href = downloadUrl;
-        pdfPreview.src = downloadUrl;
+        // PDF preview (inline) + download link (attachment)
+        const runId = data.run_id || currentRunId;
+        pdfPreview.src = `/preview/${runId}`;
+        btnDownload.href = `/download/${runId}`;
 
         // Critic data
         const critic = data.critic || {};

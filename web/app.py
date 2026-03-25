@@ -175,7 +175,6 @@ def _run_pipeline_sync(run_state: RunState, resume_text: str, jd_text: str) -> N
                         "Content floor: %.0f%% fill — re-mapping (attempt %d/%d)",
                         fill_ratio * 100, content_floor_attempts, MAX_CONTENT_FLOOR_RETRIES,
                     )
-                    from .state import Evaluation
                     synthetic_eval = Evaluation(
                         approved=False,
                         factual_drift_issues=[],
@@ -363,22 +362,35 @@ async def stream(run_id: str):
     return EventSourceResponse(event_generator())
 
 
-@app.get("/download/{run_id}")
-async def download(run_id: str):
-    """Download the generated PDF."""
+def _get_pdf_bytes(run_id: str) -> bytes:
+    """Retrieve PDF bytes for a run, raising appropriate HTTP errors."""
     if run_id not in runs:
         raise HTTPException(status_code=404, detail="Run not found.")
-
     run_state = runs[run_id]
     if run_state.pdf_bytes is None:
         if run_state.error:
             raise HTTPException(status_code=500, detail=f"Pipeline failed: {run_state.error}")
         raise HTTPException(status_code=202, detail="PDF not ready yet.")
+    return run_state.pdf_bytes
 
+
+@app.get("/preview/{run_id}")
+async def preview(run_id: str):
+    """Render PDF inline for iframe preview."""
     return Response(
-        content=run_state.pdf_bytes,
+        content=_get_pdf_bytes(run_id),
         media_type="application/pdf",
         headers={"Content-Disposition": "inline; filename=tailored_resume.pdf"},
+    )
+
+
+@app.get("/download/{run_id}")
+async def download(run_id: str):
+    """Download the generated PDF as an attachment."""
+    return Response(
+        content=_get_pdf_bytes(run_id),
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=tailored_resume.pdf"},
     )
 
 
