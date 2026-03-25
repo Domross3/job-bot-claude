@@ -229,17 +229,38 @@ class Pipeline:
         state = self.critic.run(state)
         return state
 
-    @staticmethod
-    def _find_sparse_entries(sections) -> list[str]:
-        """Return titles of work-experience entries with fewer than 3 bullets."""
+    # Per-section minimum bullet counts (enforced programmatically)
+    BULLET_MINIMUMS = {
+        "work": 3,       # per entry
+        "education": 3,  # per entry
+        "project": 2,    # per entry
+    }
+
+    @classmethod
+    def _find_sparse_entries(cls, sections) -> list[str]:
+        """Return descriptions of entries that fall below bullet minimums."""
         sparse = []
         if not sections:
             return sparse
         for section in sections:
-            if "experience" in section.heading.lower() or "work" in section.heading.lower():
-                for entry in section.entries:
-                    if len(entry.bullets) < 3:
-                        sparse.append(entry.title.strip())
+            heading = section.heading.lower()
+            if "experience" in heading or "work" in heading:
+                min_bullets = cls.BULLET_MINIMUMS["work"]
+                section_label = "Work Experience"
+            elif "education" in heading:
+                min_bullets = cls.BULLET_MINIMUMS["education"]
+                section_label = "Education"
+            elif "project" in heading:
+                min_bullets = cls.BULLET_MINIMUMS["project"]
+                section_label = "Projects"
+            else:
+                continue
+            for entry in section.entries:
+                if len(entry.bullets) < min_bullets:
+                    sparse.append(
+                        f"{section_label}: '{entry.title.strip()}' has {len(entry.bullets)} "
+                        f"bullets (minimum {min_bullets})"
+                    )
         return sparse
 
     @staticmethod
