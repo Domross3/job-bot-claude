@@ -138,27 +138,37 @@ class Pipeline:
         The number parity check is a deterministic regex gate that catches
         fabricated/altered numbers BEFORE the expensive Critic LLM call.
         If it fails, the Mapper is re-invoked with feedback (max 2 retries).
+
+        A soft bullet-floor check catches work-experience entries with <3
+        bullets and retries the Mapper with feedback (no crash).
         """
         max_parity_retries = 2
 
         for attempt in range(max_parity_retries + 1):
             state = self.mapper.run(state)
 
-            # ── DEBUG: Validate Mapper output has ≥3 bullets per Work Experience role ──
-            if state.mapped_sections:
-                for section in state.mapped_sections:
-                    if "experience" in section.heading.lower() or "work" in section.heading.lower():
-                        for entry in section.entries:
-                            print(
-                                f"DEBUG MAPPER OUTPUT: '{entry.title}' has "
-                                f"{len(entry.bullets)} bullets"
-                            )
-                            if len(entry.bullets) < 3:
-                                raise ValueError(
-                                    f"Content floor violation: '{entry.title}' has only "
-                                    f"{len(entry.bullets)} bullets (minimum 3 required). "
-                                    f"Mapper prompt is not being followed."
-                                )
+            # ── Soft bullet-floor check: retry mapper if <3 bullets ──
+            sparse_entries = self._find_sparse_entries(state.mapped_sections)
+            if sparse_entries and attempt < max_parity_retries:
+                logger.warning(
+                    "  ⚠ Bullet floor: %s — retrying mapper",
+                    ", ".join(f"'{e}'" for e in sparse_entries),
+                )
+                synthetic_eval = Evaluation(
+                    approved=False,
+                    factual_drift_issues=[],
+                    missing_keywords=[],
+                    suggestions=[
+                        f"CRITICAL: The following work experience entries have too few "
+                        f"bullets (minimum 3 required): {', '.join(sparse_entries)}. "
+                        f"Add more specific, detailed accomplishments from the master resume."
+                    ],
+                    overall_score=0.0,
+                )
+                state = state.model_copy(update={"evaluation": synthetic_eval})
+                continue
+            elif sparse_entries:
+                logger.warning("  ⚠ Bullet floor still failing after retries — proceeding")
 
             state = state.model_copy(
                 update={
@@ -220,6 +230,19 @@ class Pipeline:
         return state
 
     @staticmethod
+    def _find_sparse_entries(sections) -> list[str]:
+        """Return titles of work-experience entries with fewer than 3 bullets."""
+        sparse = []
+        if not sections:
+            return sparse
+        for section in sections:
+            if "experience" in section.heading.lower() or "work" in section.heading.lower():
+                for entry in section.entries:
+                    if len(entry.bullets) < 3:
+                        sparse.append(entry.title.strip())
+        return sparse
+
+    @staticmethod
     def _check_number_parity(state: PipelineState) -> list[str]:
         """Compare numbers in pruned_sections against master_resume.
 
@@ -250,10 +273,18 @@ class Pipeline:
 
         return issues
 
-    def _render_and_refine(self, state: PipelineState) -> PipelineState:
-        """Test render → if overflow → re-prune → repeat (max iterations).
+    # Minimum page fill ratio — drafts below this get sent back for more content
+    CONTENT_FLOOR_RATIO = 0.80
+    MAX_CONTENT_FLOOR_RETRIES = 2
 
-        Returns state with confirmed single-page content.
+    def _render_and_refine(self, state: PipelineState) -> PipelineState:
+        """Test render → if overflow → re-prune; if underfill → re-map.
+
+        Checks both directions:
+          - Overflow (>1 page): re-prune to cut content
+          - Underfill (<80% fill): re-map to add content
+
+        Returns state with confirmed single-page, well-filled content.
         """
         logger.info("▶ Starting render-and-refine loop")
 
@@ -263,8 +294,14 @@ class Pipeline:
             state = state.model_copy(update={"last_render_page_count": page_count})
 
             if page_count <= 1:
-                logger.info("  ✔ Render fits in 1 page")
-                # Clear any overflow metadata
+                # Check content floor — is the page full enough?
+                fill_ratio = self.formatter.measure_fill_ratio(state)
+                if fill_ratio < self.CONTENT_FLOOR_RATIO:
+                    state = self._enforce_content_floor(state, fill_ratio)
+                    # Re-check after adding content (might overflow now)
+                    continue
+
+                logger.info("  ✔ Render fits in 1 page (%.0f%% fill)", fill_ratio * 100)
                 state = state.model_copy(
                     update={
                         "overflow_pages": None,
@@ -321,6 +358,61 @@ class Pipeline:
                 "overflow_pages": None,
                 "render_iteration": 0,
                 "last_render_page_count": final_pages,
+            }
+        )
+        return state
+
+    def _enforce_content_floor(self, state: PipelineState, fill_ratio: float) -> PipelineState:
+        """Re-run mapper with guidance to add more content when page is underfilled."""
+        if not hasattr(self, '_content_floor_attempts'):
+            self._content_floor_attempts = 0
+
+        self._content_floor_attempts += 1
+        if self._content_floor_attempts > self.MAX_CONTENT_FLOOR_RETRIES:
+            logger.warning("  ⚠ Content floor: max retries exhausted (%.0f%% fill) — proceeding", fill_ratio * 100)
+            return state
+
+        logger.warning(
+            "  ⚠ Content floor: page only %.0f%% filled (minimum %d%%) — "
+            "re-running mapper to add content (attempt %d/%d)",
+            fill_ratio * 100, int(self.CONTENT_FLOOR_RATIO * 100),
+            self._content_floor_attempts, self.MAX_CONTENT_FLOOR_RETRIES,
+        )
+
+        # Inject synthetic evaluation telling mapper to add more content
+        synthetic_eval = Evaluation(
+            approved=False,
+            factual_drift_issues=[],
+            missing_keywords=state.evaluation.missing_keywords if state.evaluation else [],
+            suggestions=[
+                f"CRITICAL: The resume is severely underfilled — only {fill_ratio:.0%} of the "
+                f"page is used. You MUST add more content to fill at least {self.CONTENT_FLOOR_RATIO:.0%} "
+                f"of the page. Strategies: (1) Add longer, more detailed bullets with specific "
+                f"accomplishments, metrics, and context from the master resume. (2) Expand the "
+                f"Education section with honors, coursework, or activities. (3) Ensure all work "
+                f"experience entries have 3-4 substantial bullets. (4) Include all relevant "
+                f"projects from the master resume. Do NOT pad with generic filler — use real "
+                f"detail from the master resume."
+            ],
+            overall_score=0.3,
+        )
+        state = state.model_copy(update={"evaluation": synthetic_eval})
+
+        # Re-run mapper → pruner with the feedback
+        state = self.mapper.run(state)
+        state = state.model_copy(
+            update={
+                "mapped_sections": normalize_project_sections(
+                    state.mapped_sections, state.source_projects,
+                )
+            }
+        )
+        state = self.pruner.run(state)
+        state = state.model_copy(
+            update={
+                "pruned_sections": normalize_project_sections(
+                    state.pruned_sections, state.source_projects, max_bullets_per_project=3,
+                )
             }
         )
         return state

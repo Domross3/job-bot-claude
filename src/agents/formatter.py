@@ -189,6 +189,37 @@ class FormatterAgent:
         logger.info("  Test render: %d page(s)", page_count)
         return page_count
 
+    def measure_fill_ratio(self, state: PipelineState) -> float:
+        """Return how much of the usable page height the content fills (0.0–1.0).
+
+        Builds the flowable story without rendering to PDF, then sums the
+        wrapped heights to estimate fill ratio against the available frame.
+        """
+        available_height = PAGE_HEIGHT - MARGIN_TOP - MARGIN_BOTTOM
+
+        story: list = []
+        name, contact_html = self._extract_contact(state.master_resume)
+        story.append(Paragraph(_sanitize_text(self._esc(name)), self.styles["name"]))
+        if contact_html:
+            story.append(Paragraph(contact_html, self.styles["contact"]))
+        if state.pruned_sections:
+            for section in state.pruned_sections:
+                story.extend(self._build_section(section))
+
+        # Measure each flowable's wrapped height
+        total_height = 0.0
+        for flowable in story:
+            w, h = flowable.wrap(CONTENT_WIDTH, available_height)
+            total_height += h
+            # Account for spaceBefore/spaceAfter on Paragraphs
+            if hasattr(flowable, 'style'):
+                total_height += getattr(flowable.style, 'spaceBefore', 0)
+                total_height += getattr(flowable.style, 'spaceAfter', 0)
+
+        ratio = min(total_height / available_height, 1.0)
+        logger.info("  Content fill ratio: %.1f%% (%d/%dpt)", ratio * 100, total_height, available_height)
+        return ratio
+
     def run(self, state: PipelineState, output_path: Path) -> PipelineState:
         """Build and save the final PDF resume."""
         logger.info("▶ Running formatter agent [reportlab — no LLM call]")

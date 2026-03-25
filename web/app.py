@@ -152,14 +152,57 @@ def _run_pipeline_sync(run_state: RunState, resume_text: str, jd_text: str) -> N
             else:
                 logger.info("Max revisions reached or no evaluation — proceeding with best draft")
 
-        # Step 5: Render-and-refine loop
+        # Step 5: Render-and-refine loop (overflow + underfill detection)
         run_state.events.append({"step": "rendering", "detail": "Generating polished PDF..."})
+        content_floor_attempts = 0
+        CONTENT_FLOOR_RATIO = 0.80
+        MAX_CONTENT_FLOOR_RETRIES = 2
 
         for iteration in range(1, state.max_render_iterations + 1):
             page_count = formatter.test_render(state)
             page_fit_attempts += 1
 
             if page_count <= 1:
+                # Check content floor — is the page full enough?
+                fill_ratio = formatter.measure_fill_ratio(state)
+                if fill_ratio < CONTENT_FLOOR_RATIO and content_floor_attempts < MAX_CONTENT_FLOOR_RETRIES:
+                    content_floor_attempts += 1
+                    run_state.events.append({
+                        "step": "mapping",
+                        "detail": f"Page only {fill_ratio:.0%} filled — adding more content (attempt {content_floor_attempts})..."
+                    })
+                    logger.warning(
+                        "Content floor: %.0f%% fill — re-mapping (attempt %d/%d)",
+                        fill_ratio * 100, content_floor_attempts, MAX_CONTENT_FLOOR_RETRIES,
+                    )
+                    from .state import Evaluation
+                    synthetic_eval = Evaluation(
+                        approved=False,
+                        factual_drift_issues=[],
+                        missing_keywords=state.evaluation.missing_keywords if state.evaluation else [],
+                        suggestions=[
+                            f"CRITICAL: The resume is only {fill_ratio:.0%} filled. Add more detailed "
+                            f"bullets with specific accomplishments and metrics from the master resume. "
+                            f"Ensure all work entries have 3-4 substantial bullets. Include all projects. "
+                            f"Expand Education with honors, coursework, or activities."
+                        ],
+                        overall_score=0.3,
+                    )
+                    state = state.model_copy(update={"evaluation": synthetic_eval})
+                    state = mapper.run(state)
+                    state = state.model_copy(
+                        update={"mapped_sections": normalize_project_sections(state.mapped_sections, state.source_projects)}
+                    )
+                    run_state.events.append({"step": "pruning", "detail": "Re-optimizing expanded content..."})
+                    state = pruner.run(state)
+                    state = state.model_copy(
+                        update={
+                            "pruned_sections": normalize_project_sections(
+                                state.pruned_sections, state.source_projects, max_bullets_per_project=3
+                            )
+                        }
+                    )
+                    continue
                 break
 
             # Overflow — re-prune
