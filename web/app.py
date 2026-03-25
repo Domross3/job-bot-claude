@@ -378,7 +378,7 @@ async def download(run_id: str):
     return Response(
         content=run_state.pdf_bytes,
         media_type="application/pdf",
-        headers={"Content-Disposition": "attachment; filename=tailored_resume.pdf"},
+        headers={"Content-Disposition": "inline; filename=tailored_resume.pdf"},
     )
 
 
