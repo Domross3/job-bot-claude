@@ -1178,6 +1178,12 @@
         // Trigger reflow for animation
         void resultSection.offsetWidth;
         resultSection.classList.add('visible');
+
+        // Re-enable generate button so user can swap the JD and regenerate
+        // without re-uploading their resume
+        generateSection.style.display = '';
+        btnGenerate.textContent = '⚡  Generate Another';
+        checkReady();
       }
 
       // ── Star Rating ──
