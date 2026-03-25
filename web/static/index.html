@@ -1126,12 +1126,13 @@
 
         // Critic data
         const critic = data.critic || {};
-        const score = critic.score != null ? critic.score : 0;
+        const rawScore = critic.overall_score != null ? critic.overall_score : 0;
+        const displayScore = (rawScore * 10).toFixed(1); // 0.0-1.0 → 0.0-10.0
         const circumference = 188.5; // 2 * PI * 30
-        const offset = circumference - (score / 10) * circumference;
+        const offset = circumference - rawScore * circumference;
         scoreRingFill.style.strokeDashoffset = circumference;
 
-        scoreValue.textContent = score.toFixed(1);
+        scoreValue.textContent = displayScore;
 
         // Animate ring
         requestAnimationFrame(() => {
@@ -1140,10 +1141,10 @@
           });
         });
 
-        // Color the ring based on score
-        if (score >= 8) {
+        // Color the ring based on score (0.0-1.0 scale)
+        if (rawScore >= 0.8) {
           scoreRingFill.style.stroke = 'var(--success)';
-        } else if (score >= 6) {
+        } else if (rawScore >= 0.6) {
           scoreRingFill.style.stroke = '#f59e0b';
         } else {
           scoreRingFill.style.stroke = 'var(--error)';
