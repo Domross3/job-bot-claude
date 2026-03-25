@@ -1060,8 +1060,11 @@
       });
 
       // ── SSE Stream ──
+      let streamComplete = false;
+
       function connectStream(runId) {
         if (eventSource) eventSource.close();
+        streamComplete = false;
 
         eventSource = new EventSource(`/stream/${runId}`);
 
@@ -1070,6 +1073,7 @@
             const data = JSON.parse(event.data);
 
             if (data.step === 'error') {
+              streamComplete = true;
               showError(data.detail || 'An unexpected error occurred.');
               stepperSection.classList.remove('visible');
               generateSection.style.display = '';
@@ -1078,6 +1082,7 @@
             }
 
             if (data.step === 'complete') {
+              streamComplete = true;
               completeAllSteps();
               eventSource.close();
               setTimeout(() => showResult(data), 600);
@@ -1092,9 +1097,14 @@
 
         eventSource.onerror = () => {
           eventSource.close();
-          showError('Connection lost. Please try again.');
-          stepperSection.classList.remove('visible');
-          generateSection.style.display = '';
+          // Only show error if the stream didn't complete normally —
+          // EventSource fires onerror when the server closes the connection,
+          // even after a successful stream.
+          if (!streamComplete) {
+            showError('Connection lost. Please try again.');
+            stepperSection.classList.remove('visible');
+            generateSection.style.display = '';
+          }
         };
       }
 
