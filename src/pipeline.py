@@ -402,14 +402,13 @@ class Pipeline:
             factual_drift_issues=[],
             missing_keywords=state.evaluation.missing_keywords if state.evaluation else [],
             suggestions=[
-                f"CRITICAL: The resume is severely underfilled — only {fill_ratio:.0%} of the "
-                f"page is used. You MUST add more content to fill at least {self.CONTENT_FLOOR_RATIO:.0%} "
-                f"of the page. Strategies: (1) Add longer, more detailed bullets with specific "
-                f"accomplishments, metrics, and context from the master resume. (2) Expand the "
-                f"Education section with honors, coursework, or activities. (3) Ensure all work "
-                f"experience entries have 3-4 substantial bullets. (4) Include all relevant "
-                f"projects from the master resume. Do NOT pad with generic filler — use real "
-                f"detail from the master resume."
+                f"CRITICAL: The resume is only {fill_ratio:.0%} filled — it MUST fill at least "
+                f"{self.CONTENT_FLOOR_RATIO:.0%}. Your CURRENT DRAFT is included below. You must "
+                f"keep ALL existing content and ADD MORE. Do NOT remove or shorten any existing "
+                f"bullets. Strategies: (1) Add a 4th bullet to work entries that only have 3. "
+                f"(2) Expand bullets with specific metrics, tools, and outcomes from the master resume. "
+                f"(3) Add more education bullets (honors, relevant coursework, activities). "
+                f"(4) Lengthen short one-line bullets into detailed two-liners with context."
             ],
             overall_score=0.3,
         )

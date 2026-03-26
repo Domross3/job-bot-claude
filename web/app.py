@@ -180,10 +180,13 @@ def _run_pipeline_sync(run_state: RunState, resume_text: str, jd_text: str) -> N
                         factual_drift_issues=[],
                         missing_keywords=state.evaluation.missing_keywords if state.evaluation else [],
                         suggestions=[
-                            f"CRITICAL: The resume is only {fill_ratio:.0%} filled. Add more detailed "
-                            f"bullets with specific accomplishments and metrics from the master resume. "
-                            f"Ensure all work entries have 3-4 substantial bullets. Include all projects. "
-                            f"Expand Education with honors, coursework, or activities."
+                            f"CRITICAL: The resume is only {fill_ratio:.0%} filled — it MUST fill at least 80%. "
+                            f"Your CURRENT DRAFT is included below. You must keep ALL existing content and ADD MORE. "
+                            f"Do NOT remove or shorten any existing bullets. Strategies to add content: "
+                            f"(1) Add a 4th bullet to work experience entries that only have 3. "
+                            f"(2) Expand bullets with specific metrics, tools, and outcomes from the master resume. "
+                            f"(3) Add more education bullets (honors, relevant coursework, activities). "
+                            f"(4) Lengthen short one-line bullets into detailed two-liners with context."
                         ],
                         overall_score=0.3,
                     )

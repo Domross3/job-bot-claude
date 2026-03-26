@@ -36,6 +36,15 @@ class MapperAgent(BaseAgent):
             parts.append(f"Suggestions: {json.dumps(state.evaluation.suggestions)}")
             parts.append("=== END CRITIC FEEDBACK ===")
 
+            # Include the current draft so the mapper can expand on it
+            # rather than starting from scratch and potentially producing less
+            current_draft = state.pruned_sections or state.mapped_sections
+            if current_draft:
+                draft_json = "[" + ", ".join(s.model_dump_json() for s in current_draft) + "]"
+                parts.append("\n=== CURRENT DRAFT (expand on this, do NOT produce less content) ===")
+                parts.append(draft_json)
+                parts.append("=== END CURRENT DRAFT ===")
+
         return "\n".join(parts)
 
     def _parse_and_update(self, state: PipelineState, raw: str) -> PipelineState:
