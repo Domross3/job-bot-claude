@@ -52,15 +52,21 @@ system_prompt: |
 
   SPATIAL CONSTRAINTS (the final resume must fit on exactly 1 page):
   CRITICAL: Do NOT use hard returns or line breaks (\n) inside a bullet point. Write one continuous sentence.
-  BULLET LENGTH RULES — the page is ~85 characters wide:
-    - A bullet that fits on one line (~85 chars or fewer) is IDEAL. Keep it tight and impactful.
-    - A bullet that fills two full lines (~150-175 chars) is FINE — use this for your strongest, most detailed accomplishments.
-    - NEVER write a bullet that is 86-110 characters. This creates an ugly "orphan" — one line plus 1-4 dangling words on a second line. Either cut words to fit one line, or expand detail to fill two lines.
-  VALID one-liner (~80 chars): "Built pro forma financial model projecting 29% gross margins for investor outreach"
-  VALID two-liner (~165 chars): "Led cross-functional team of eight consultants to overhaul stakeholder engagement strategy, generating actionable data-backed insights for client market expansion"
-  INVALID orphan (~95 chars): "Led cross-functional team of eight consultants using data-driven approach for client expansion strategy" (spills 2 words onto line 2 — ugly)
+  You must generate a MINIMUM of 3 bullet points for all Work Experience entries, and exactly 2 to 3 bullet points for every Project.
+  STRICT BULLET LENGTH RULE: You must NEVER write a bullet point that spills over by only 1 to 4 words on a second line.
+    - If a bullet is short, cut filler words to ensure it fits strictly on ONE single line.
+    - If a bullet is detailed, you must expand the detail to ensure the second line reaches at least 75% of the way across the page.
+  EXAMPLE OF A VALID 2-LINE BULLET (Approx 180 chars):
+  "Led cross-functional team of eight consultants to completely overhaul the client's stakeholder engagement strategy, generating actionable, data-backed insights for market expansion."
+  EXAMPLE OF AN INVALID BULLET (DO NOT DO THIS):
+  "Led cross-functional team of eight consultants using data-driven approach and root-cause analysis for client expansion strategy." (Too short, creates an orphan word).
   10. Follow both the strict length rule and bullet length rule above for every bullet.
-  11. These are hard limits — the output will be programmatically rendered to PDF and MUST fit in a single page.
+  11. Include up to 4 Work Experience roles. Include the most relevant, but err on the side of INCLUDING more rather than less. A downstream Pruner will handle overflow.
+  12. Each Work Experience role MUST have 3-4 bullets. Prefer 4 when the source material supports it. Each Project MUST have 2-3 bullets.
+  13. Education section: 1 entry with 4-6 bullets. This is a COLLEGE STUDENT resume — Education is a primary differentiator. Include GPA, ALL honors/scholarships (Gilman Scholar, S-STEM, ELP, etc.), study abroad, and relevant coursework. Do NOT summarize multiple scholarships into one bullet — give each its own bullet. The downstream Pruner will trim if needed.
+  14. Projects section: include EVERY source project, 2-3 bullets each.
+  15. Skills section: group into 3-5 concise category lines.
+  16. IMPORTANT: Generate MORE content rather than less. The downstream Pruner and render loop will trim to fit exactly 1 page. Your job is to provide a rich, dense pool of tailored content.
 
   RESPONSE FORMAT:
   - You may include a concise high-level reasoning summary inside <thinking> tags for debugging visibility. Do NOT include exhaustive hidden chain-of-thought.
