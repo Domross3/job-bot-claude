@@ -147,6 +147,8 @@ def _build_styles() -> dict[str, ParagraphStyle]:
             spaceAfter=1,
         ),
         # ── Bullet points (hanging indent: wrapped lines align under text, not bullet glyph)
+        # leftIndent=24 nests bullets visually under section headings;
+        # firstLineIndent=-12 hangs the bullet glyph to the left of the text.
         "bullet": ParagraphStyle(
             "Bullet",
             parent=base["Normal"],
@@ -154,8 +156,8 @@ def _build_styles() -> dict[str, ParagraphStyle]:
             fontSize=9,
             leading=14,
             textColor=COLOR_BODY,
-            leftIndent=10,
-            firstLineIndent=-10,
+            leftIndent=24,
+            firstLineIndent=-12,
             spaceBefore=0.5,
             spaceAfter=2,
         ),
@@ -198,12 +200,16 @@ class FormatterAgent:
         return self.measure_render(state).page_count
 
     def measure_render(self, state: PipelineState) -> RenderMetrics:
-        """Render in-memory and capture page count plus estimated fill ratio."""
+        """Render in-memory and capture page count plus estimated fill ratio.
+
+        Builds the story once and reuses it for both height measurement and
+        PDF render (previously built it twice per call).
+        """
         story = self._build_story(state)
         used_height = self._measure_story_height(story)
 
         buffer = BytesIO()
-        page_count = self._build_pdf(state, buffer)
+        page_count = self._build_story_to_output(story, buffer)
         buffer.close()
 
         fill_ratio = used_height / AVAILABLE_HEIGHT if AVAILABLE_HEIGHT else 0.0
@@ -455,12 +461,45 @@ class FormatterAgent:
     # ── Education entry (special layout) ─────────────────────────
 
     def _build_education_entry(self, entry) -> list:
-        """Education: org on line 1 with dates flush-right, degree on line 2."""
+        """Education: org on line 1 with dates flush-right, degree on line 2.
+
+        The Mapper may place the university name in either `organization` or
+        `title`. We detect which field holds the university by checking for
+        keywords like "university", "college", "institute", then assign
+        accordingly so the bold line is always the institution and the italic
+        line is always the degree.
+        """
         elements: list = []
+
+        # ── Normalize field assignment ────────────────────────────
+        org_text = (entry.organization or "").strip()
+        title_text = (entry.title or "").strip()
+
+        uni_keywords = ("university", "college", "institute", "school")
+        org_is_uni = any(kw in org_text.lower() for kw in uni_keywords)
+        title_is_uni = any(kw in title_text.lower() for kw in uni_keywords)
+
+        if title_is_uni and not org_is_uni:
+            # Fields are swapped — title holds the university name
+            institution = title_text
+            degree = org_text
+        else:
+            institution = org_text
+            degree = title_text
+
+        # Abbreviate excessively long college names
+        institution = institution.replace(
+            "College of Literature, Science, and the Arts",
+            "College of LSA",
+        )
+        degree = degree.replace(
+            "College of Literature, Science, and the Arts",
+            "College of LSA",
+        )
 
         # Line 1: University name (left, bold) | Dates (right, italic)
         org_para = Paragraph(
-            f"<b>{self._esc(entry.organization)}</b>",
+            f"<b>{self._esc(institution)}</b>",
             self.styles["entry_left"],
         )
         dates_para = Paragraph(
@@ -470,15 +509,11 @@ class FormatterAgent:
         tbl = self._make_entry_row(org_para, dates_para, space_before=4)
         elements.append(tbl)
 
-        # Line 2: Degree / title — hardcoded abbreviation for long college names
-        if entry.title:
-            edu_title = entry.title.replace(
-                "College of Literature, Science, and the Arts",
-                "College of LSA",
-            )
+        # Line 2: Degree / title in italics
+        if degree:
             elements.append(
                 Paragraph(
-                    _sanitize_text(self._esc(edu_title)),
+                    _sanitize_text(self._esc(degree)),
                     self.styles["edu_degree"],
                 )
             )

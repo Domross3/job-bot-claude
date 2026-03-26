@@ -23,7 +23,9 @@ logger = logging.getLogger(__name__)
 # ── Regex for extracting numbers (handles negatives, decimals, comma groups) ──
 _NUMBER_RE = re.compile(r"-?\d+(?:,\d{3})*(?:\.\d+)?")
 _TARGET_PAGE_FILL_RATIO = 0.95
+_UNDERFILL_THRESHOLD = 0.80
 _MAX_DETERMINISTIC_PRUNE_STEPS = 24
+_MAX_EXPAND_STEPS = 12
 _MIN_WORK_BULLETS = 3
 _MIN_EDUCATION_BULLETS = 2
 _MIN_PROJECT_BULLETS = 1
@@ -31,13 +33,21 @@ _MIN_PROJECT_BULLETS = 1
 
 @dataclass(frozen=True)
 class _PruneCandidate:
-    """A single removable unit considered by the deterministic prune loop."""
+    """A single removable unit considered by the deterministic prune loop.
+
+    The sort key is (relevance_score, section_priority) where lower values
+    are removed first.  This means the least-relevant content gets cut
+    before more-relevant content, regardless of which section it lives in.
+    ``section_priority`` is only a tiebreaker when two candidates share the
+    same relevance score.
+    """
 
     kind: str
     section_index: int
     entry_index: int
     bullet_index: int | None
-    penalty: float
+    relevance: float          # the entry's relevance_score (0.0–1.0)
+    section_priority: float   # tiebreaker: skills=0, projects=1, education=2, work=3
     label: str
 
 
@@ -208,6 +218,9 @@ class Pipeline:
                 }
             )
 
+            # ── Underfill guard: reject pruner output that lost content ──
+            state = self._guard_pruner_underfill(state)
+
             # ── Programmatic number parity gate ──────────────────
             drift_issues = self._check_number_parity(state)
 
@@ -279,6 +292,63 @@ class Pipeline:
         return sparse
 
     @staticmethod
+    def _count_bullets(sections) -> int:
+        """Total bullet count across all sections."""
+        if not sections:
+            return 0
+        return sum(len(e.bullets) for s in sections for e in s.entries)
+
+    @staticmethod
+    def _count_entries(sections) -> int:
+        """Total entry count across all sections."""
+        if not sections:
+            return 0
+        return sum(len(s.entries) for s in sections)
+
+    def _guard_pruner_underfill(self, state: PipelineState) -> PipelineState:
+        """If the LLM Pruner dropped bullets or entries, fall back to mapped_sections.
+
+        The pruner's job is quality polish, not content removal.  If it
+        removed more than 10% of the bullets or dropped any entries, its
+        output is rejected and we use the mapped_sections directly (with
+        project normalization applied).
+        """
+        if not state.mapped_sections or not state.pruned_sections:
+            return state
+
+        mapped_bullets = self._count_bullets(state.mapped_sections)
+        pruned_bullets = self._count_bullets(state.pruned_sections)
+        mapped_entries = self._count_entries(state.mapped_sections)
+        pruned_entries = self._count_entries(state.pruned_sections)
+
+        # Allow up to 10% bullet loss (from true redundancy merges)
+        bullet_loss = (mapped_bullets - pruned_bullets) / max(mapped_bullets, 1)
+        entry_loss = mapped_entries - pruned_entries
+
+        if bullet_loss > 0.10 or entry_loss > 0:
+            logger.warning(
+                "  ⚠ Pruner over-cut: %d→%d bullets (%.0f%% loss), %d→%d entries. "
+                "Falling back to mapped_sections.",
+                mapped_bullets, pruned_bullets, bullet_loss * 100,
+                mapped_entries, pruned_entries,
+            )
+            print(
+                f"\n  ⚠  Pruner dropped content ({mapped_bullets}→{pruned_bullets} bullets, "
+                f"{mapped_entries}→{pruned_entries} entries). Using Mapper output instead."
+            )
+            state = state.model_copy(
+                update={
+                    "pruned_sections": normalize_project_sections(
+                        state.mapped_sections,
+                        state.source_projects,
+                        max_bullets_per_project=3,
+                    )
+                }
+            )
+
+        return state
+
+    @staticmethod
     def _check_number_parity(state: PipelineState) -> list[str]:
         """Compare numbers in pruned_sections against master_resume.
 
@@ -310,7 +380,13 @@ class Pipeline:
         return issues
 
     def _render_and_refine(self, state: PipelineState) -> PipelineState:
-        """Measure the draft, then prune overflow locally without extra LLM calls."""
+        """Bidirectional page fitting: prune overflow OR expand underfill.
+
+        1. Measure the current draft.
+        2. If >1 page → deterministic prune (remove lowest-relevance units).
+        3. If 1 page but <80% fill → deterministic expand (restore from mapped_sections).
+        4. Accept when 1 page and fill is in the target band.
+        """
         logger.info("▶ Starting render-and-refine loop")
         state = self._enforce_project_retention(state)
         metrics = self.formatter.measure_render(state)
@@ -323,23 +399,39 @@ class Pipeline:
             }
         )
 
-        if metrics.page_count <= 1:
-            logger.info("  ✔ Render fits in 1 page (fill %.0f%%)", metrics.fill_ratio * 100)
-            return state
+        # ── Overflow path ─────────────────────────────────────────
+        if metrics.page_count > 1:
+            logger.warning(
+                "  ⚠ Overflow detected: %d pages (fill %.0f%%) — pruning locally",
+                metrics.page_count,
+                metrics.fill_ratio * 100,
+            )
+            print(
+                f"\n  ⚠  Render overflow: {metrics.page_count} pages "
+                f"({metrics.fill_ratio * 100:.0f}% fill) — pruning locally"
+            )
 
-        logger.warning(
-            "  ⚠ Overflow detected: %d pages (fill %.0f%%) — pruning locally",
-            metrics.page_count,
-            metrics.fill_ratio * 100,
-        )
-        print(
-            f"\n  ⚠  Render overflow: {metrics.page_count} pages "
-            f"({metrics.fill_ratio * 100:.0f}% fill) — pruning locally"
-        )
+            state = self._prune_to_fit_deterministically(state, metrics)
+            state = self._enforce_project_retention(state)
 
-        state = self._prune_to_fit_deterministically(state, metrics)
-        state = self._enforce_project_retention(state)
+        # ── Underfill path ────────────────────────────────────────
+        underfill_metrics = self.formatter.measure_render(state)
+        if (
+            underfill_metrics.page_count <= 1
+            and underfill_metrics.fill_ratio < _UNDERFILL_THRESHOLD
+            and state.mapped_sections
+        ):
+            logger.info(
+                "  ⚠ Underfill detected: %.0f%% fill — expanding from mapped pool",
+                underfill_metrics.fill_ratio * 100,
+            )
+            print(
+                f"\n  ⚠  Page underfilled ({underfill_metrics.fill_ratio * 100:.0f}% fill) "
+                f"— restoring content from Mapper output"
+            )
+            state = self._expand_to_fill(state, underfill_metrics)
 
+        # ── Final measurement ─────────────────────────────────────
         final_metrics = self.formatter.measure_render(state)
         state = state.model_copy(
             update={
@@ -351,8 +443,13 @@ class Pipeline:
         )
         if final_metrics.page_count > 1:
             print(
-                f"\n  ⚠  Could not fit to 1 page after {_MAX_DETERMINISTIC_PRUNE_STEPS} "
-                f"deterministic prune steps ({final_metrics.page_count} pages)."
+                f"\n  ⚠  Could not fit to 1 page after deterministic "
+                f"prune steps ({final_metrics.page_count} pages)."
+            )
+        else:
+            logger.info(
+                "  ✔ Final render: 1 page, %.0f%% fill",
+                final_metrics.fill_ratio * 100,
             )
         return state
 
@@ -557,19 +654,183 @@ class Pipeline:
 
         return current_state
 
+    def _expand_to_fill(self, state: PipelineState, metrics) -> PipelineState:
+        """Restore bullets/entries from mapped_sections to fill an underfilled page.
+
+        Walks through mapped_sections looking for content that exists in the
+        Mapper output but was removed from pruned_sections (by the LLM Pruner
+        or the deterministic pruner).  Adds the highest-relevance missing
+        content one unit at a time, re-rendering after each addition, and
+        stops when the fill ratio is in the target band or adding more would
+        overflow.
+        """
+        current_state = state
+        current_metrics = metrics
+
+        if not state.mapped_sections:
+            return state
+
+        for step in range(1, _MAX_EXPAND_STEPS + 1):
+            if current_metrics.fill_ratio >= _UNDERFILL_THRESHOLD:
+                return current_state
+
+            # Find restorable content: bullets in mapped but missing from pruned
+            candidates = self._enumerate_expand_candidates(
+                current_state.pruned_sections,
+                state.mapped_sections,
+            )
+            if not candidates:
+                logger.info("  ✔ No more content to restore from Mapper pool")
+                break
+
+            # Try the highest-relevance candidate first
+            for candidate in candidates:
+                expanded_sections = self._apply_expand_candidate(
+                    current_state.pruned_sections,
+                    candidate,
+                )
+                expanded_state = current_state.model_copy(
+                    update={"pruned_sections": expanded_sections}
+                )
+                expanded_metrics = self.formatter.measure_render(expanded_state)
+
+                if expanded_metrics.page_count > 1:
+                    # Adding this would overflow — skip it, try next
+                    continue
+
+                # Accept this expansion
+                current_state = expanded_state
+                current_metrics = expanded_metrics
+                logger.info(
+                    "  ✔ Expand step %d: %s → fill %.0f%%",
+                    step, candidate["label"], current_metrics.fill_ratio * 100,
+                )
+                print(
+                    f"     → Expand {step}: {candidate['label']} "
+                    f"→ {current_metrics.fill_ratio * 100:.0f}% fill"
+                )
+                break
+            else:
+                # No candidate could be added without overflow
+                logger.info("  ✔ Expansion stopped: all remaining candidates would overflow")
+                break
+
+        return current_state
+
+    def _enumerate_expand_candidates(self, pruned_sections, mapped_sections) -> list[dict]:
+        """Find bullets present in mapped_sections but missing from pruned_sections.
+
+        Returns a list of dicts sorted by relevance (highest first), each
+        describing one restorable unit.
+        """
+        candidates: list[dict] = []
+
+        # Index pruned content for fast lookup
+        pruned_bullets_by_entry: dict[tuple[str, str], set[str]] = {}
+        pruned_entry_keys: set[tuple[str, str]] = set()
+        for section in (pruned_sections or []):
+            for entry in section.entries:
+                key = (self._section_kind(section.heading), entry.title.strip().lower())
+                pruned_entry_keys.add(key)
+                pruned_bullets_by_entry[key] = {b.strip().lower() for b in entry.bullets}
+
+        for section in (mapped_sections or []):
+            section_kind = self._section_kind(section.heading)
+            for entry in section.entries:
+                relevance = entry.relevance_score if entry.relevance_score is not None else 0.5
+                key = (section_kind, entry.title.strip().lower())
+
+                if key not in pruned_entry_keys and section_kind != "skills":
+                    # Whole entry is missing — can restore it
+                    candidates.append({
+                        "type": "entry",
+                        "section_kind": section_kind,
+                        "section_heading": section.heading,
+                        "entry": entry,
+                        "relevance": relevance,
+                        "label": f"restore entry {entry.title}",
+                    })
+                    continue
+
+                # Check for missing bullets within an existing entry
+                existing_bullets = pruned_bullets_by_entry.get(key, set())
+                for bullet in entry.bullets:
+                    if bullet.strip().lower() not in existing_bullets:
+                        candidates.append({
+                            "type": "bullet",
+                            "section_kind": section_kind,
+                            "entry_title": entry.title,
+                            "bullet": bullet,
+                            "relevance": relevance,
+                            "label": f"restore bullet in {entry.title}",
+                        })
+
+        # Sort by relevance descending — restore highest-value content first
+        candidates.sort(key=lambda c: -c["relevance"])
+        return candidates
+
+    def _apply_expand_candidate(self, sections, candidate: dict) -> list[ResumeSection]:
+        """Apply one expansion and return a new section list."""
+        cloned = [s.model_copy(deep=True) for s in (sections or [])]
+
+        if candidate["type"] == "entry":
+            # Find or create the target section
+            target_idx = None
+            for idx, section in enumerate(cloned):
+                if self._section_kind(section.heading) == candidate["section_kind"]:
+                    target_idx = idx
+                    break
+
+            if target_idx is not None:
+                cloned[target_idx].entries.append(candidate["entry"].model_copy(deep=True))
+            else:
+                cloned.append(
+                    ResumeSection(
+                        heading=candidate["section_heading"],
+                        entries=[candidate["entry"].model_copy(deep=True)],
+                    )
+                )
+            return cloned
+
+        if candidate["type"] == "bullet":
+            for section in cloned:
+                if self._section_kind(section.heading) != candidate["section_kind"]:
+                    continue
+                for entry in section.entries:
+                    if entry.title.strip().lower() == candidate["entry_title"].strip().lower():
+                        entry.bullets.append(candidate["bullet"])
+                        return cloned
+
+        return cloned
+
     def _enumerate_prune_candidates(self, sections) -> list[_PruneCandidate]:
-        """Return removable units ordered by semantic cost, not just size."""
+        """Return removable units sorted by relevance (lowest relevance removed first).
+
+        Section minimums are still enforced — we won't enumerate a candidate
+        that would violate a floor (e.g. dropping a work role below 3 bullets).
+        Beyond that, the *only* ranking signal is the entry's relevance_score
+        as set by the Mapper.  Section kind is a tiebreaker, not a gate.
+
+        Section priority tiebreaker (lower = cut first when relevance ties):
+            skills = 0, projects = 1, education = 2, work = 3
+        """
+        _SECTION_PRIORITY = {"skills": 0.0, "projects": 1.0, "education": 2.0, "work": 3.0, "other": 1.5}
+
         candidates: list[_PruneCandidate] = []
         if not sections:
             return candidates
 
         for section_index, section in enumerate(sections):
             section_kind = self._section_kind(section.heading)
+            priority = _SECTION_PRIORITY.get(section_kind, 1.5)
+
             for entry_index, entry in enumerate(section.entries):
                 bullets = entry.bullets or []
                 relevance = entry.relevance_score if entry.relevance_score is not None else 0.5
 
                 if section_kind == "skills":
+                    # Skills entries don't carry individual relevance; use 0.0
+                    # so they're naturally among the first things cut.
                     for bullet_index in range(len(bullets) - 1, -1, -1):
                         candidates.append(
                             _PruneCandidate(
@@ -577,78 +838,50 @@ class Pipeline:
                                 section_index=section_index,
                                 entry_index=entry_index,
                                 bullet_index=bullet_index,
-                                penalty=1.0 + (0.1 * bullet_index),
+                                relevance=0.0,
+                                section_priority=priority,
                                 label=f"remove skills line {bullet_index + 1}",
                             )
                         )
                     continue
 
+                # Determine per-section bullet floor
                 if section_kind == "education":
-                    for bullet_index in range(
-                        len(bullets) - 1,
-                        _MIN_EDUCATION_BULLETS - 1,
-                        -1,
-                    ):
-                        bullet_text = bullets[bullet_index]
-                        candidates.append(
-                            _PruneCandidate(
-                                kind="education_bullet",
-                                section_index=section_index,
-                                entry_index=entry_index,
-                                bullet_index=bullet_index,
-                                penalty=self._education_bullet_penalty(bullet_text),
-                                label=f"trim education bullet {bullet_index + 1}",
-                            )
-                        )
-                    continue
+                    min_bullets = _MIN_EDUCATION_BULLETS
+                elif section_kind == "projects":
+                    min_bullets = _MIN_PROJECT_BULLETS
+                elif section_kind == "work":
+                    min_bullets = _MIN_WORK_BULLETS
+                else:
+                    min_bullets = 0
 
-                if section_kind == "projects":
-                    for bullet_index in range(
-                        len(bullets) - 1,
-                        _MIN_PROJECT_BULLETS - 1,
-                        -1,
-                    ):
-                        candidates.append(
-                            _PruneCandidate(
-                                kind="project_bullet",
-                                section_index=section_index,
-                                entry_index=entry_index,
-                                bullet_index=bullet_index,
-                                penalty=4.0 + (2.5 * relevance),
-                                label=f"trim project bullet {bullet_index + 1} from {entry.title}",
-                            )
+                # Individual bullet removals (last bullet first within an entry)
+                for bullet_index in range(len(bullets) - 1, min_bullets - 1, -1):
+                    candidates.append(
+                        _PruneCandidate(
+                            kind=f"{section_kind}_bullet",
+                            section_index=section_index,
+                            entry_index=entry_index,
+                            bullet_index=bullet_index,
+                            relevance=relevance,
+                            section_priority=priority,
+                            label=f"trim {section_kind} bullet {bullet_index + 1} from {entry.title}",
                         )
-                    continue
+                    )
 
-                if section_kind == "work":
-                    for bullet_index in range(
-                        len(bullets) - 1,
-                        _MIN_WORK_BULLETS - 1,
-                        -1,
-                    ):
-                        position_penalty = 0.5 if bullet_index >= 2 else 2.0
-                        candidates.append(
-                            _PruneCandidate(
-                                kind="work_bullet",
-                                section_index=section_index,
-                                entry_index=entry_index,
-                                bullet_index=bullet_index,
-                                penalty=6.0 + position_penalty + (4.0 * relevance),
-                                label=f"trim work bullet {bullet_index + 1} from {entry.title}",
-                            )
+                # Whole-entry removal (only if section has enough entries)
+                if section_kind == "work" and len(section.entries) > 2:
+                    candidates.append(
+                        _PruneCandidate(
+                            kind="work_entry",
+                            section_index=section_index,
+                            entry_index=entry_index,
+                            bullet_index=None,
+                            relevance=relevance,
+                            section_priority=priority,
+                            label=f"remove work entry {entry.title}",
                         )
-
-                    if len(section.entries) > 3:
-                        candidates.append(
-                            _PruneCandidate(
-                                kind="work_entry",
-                                section_index=section_index,
-                                entry_index=entry_index,
-                                bullet_index=None,
-                                penalty=18.0 + (8.0 * relevance),
-                                label=f"remove work entry {entry.title}",
-                            )
-                        )
+                    )
 
         return candidates
 
@@ -662,14 +895,20 @@ class Pipeline:
 
     @staticmethod
     def _select_best_candidate(options):
-        """Prefer the fullest fitting draft; otherwise take the strongest overflow cut."""
+        """Pick the best single removal to make this step.
+
+        If any candidate brings us to 1 page, pick the one closest to
+        the target fill ratio (preferring to keep more content).  If no
+        candidate fits on 1 page yet, pick the one that cuts the most
+        overflow while sacrificing the least relevance.
+        """
         fitting = [option for option in options if option[2].page_count <= 1]
         if fitting:
             return min(
                 fitting,
                 key=lambda option: (
                     abs(option[2].fill_ratio - _TARGET_PAGE_FILL_RATIO),
-                    option[0].penalty,
+                    option[0].relevance,  # prefer cutting lower-relevance
                 ),
             )
 
@@ -678,7 +917,8 @@ class Pipeline:
             key=lambda option: (
                 option[2].page_count,
                 option[2].fill_ratio,
-                option[0].penalty,
+                option[0].relevance,        # cut lowest relevance first
+                option[0].section_priority,  # tiebreaker: skills before work
             ),
         )
 
@@ -727,22 +967,6 @@ class Pipeline:
         if "experience" in heading_lower or "work" in heading_lower:
             return "work"
         return "other"
-
-    @staticmethod
-    def _education_bullet_penalty(text: str) -> float:
-        """Protect GPA, honors, and named awards before generic coursework bullets."""
-        normalized = text.lower()
-        protected_terms = (
-            "gpa",
-            "honor",
-            "scholar",
-            "award",
-            "fellow",
-            "dean",
-            "gilman",
-            "s-stem",
-        )
-        return 4.0 + (2.0 if any(term in normalized for term in protected_terms) else 0.0)
 
     def _find_sparse_work_entries(self, sections, min_bullets: int) -> list[str]:
         """Return work entries that violate the soft bullet floor."""
