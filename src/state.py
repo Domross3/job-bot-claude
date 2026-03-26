@@ -106,5 +106,9 @@ class PipelineState(BaseModel):
         default=None,
         description="Most recent page count observed during formatter test render",
     )
+    last_render_fill_ratio: float | None = Field(
+        default=None,
+        description="Estimated fraction of the printable frame consumed by the latest render",
+    )
     render_iteration: int = 0
     max_render_iterations: int = 3

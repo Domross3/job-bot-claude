@@ -11,6 +11,7 @@ professionally styled PDF with:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
 import re
 from io import BytesIO
@@ -53,6 +54,7 @@ MARGIN_RIGHT = 0.5 * inch
 MARGIN_TOP = 0.4 * inch
 MARGIN_BOTTOM = 0.4 * inch
 CONTENT_WIDTH = PAGE_WIDTH - MARGIN_LEFT - MARGIN_RIGHT
+AVAILABLE_HEIGHT = PAGE_HEIGHT - MARGIN_TOP - MARGIN_BOTTOM
 
 # ── Text sanitization patterns ───────────────────────────────────
 # Common LLM font-confusion fixes (sans-serif I vs l)
@@ -171,6 +173,16 @@ def _build_styles() -> dict[str, ParagraphStyle]:
     }
 
 
+@dataclass(frozen=True)
+class RenderMetrics:
+    """Layout metrics captured from a formatter test render."""
+
+    page_count: int
+    fill_ratio: float
+    used_height: float
+    available_height: float
+
+
 # ── The Agent ────────────────────────────────────────────────────
 
 class FormatterAgent:
@@ -183,11 +195,30 @@ class FormatterAgent:
 
     def test_render(self, state: PipelineState) -> int:
         """Render to an in-memory buffer and return the page count."""
+        return self.measure_render(state).page_count
+
+    def measure_render(self, state: PipelineState) -> RenderMetrics:
+        """Render in-memory and capture page count plus estimated fill ratio."""
+        story = self._build_story(state)
+        used_height = self._measure_story_height(story)
+
         buffer = BytesIO()
         page_count = self._build_pdf(state, buffer)
         buffer.close()
-        logger.info("  Test render: %d page(s)", page_count)
-        return page_count
+
+        fill_ratio = used_height / AVAILABLE_HEIGHT if AVAILABLE_HEIGHT else 0.0
+        metrics = RenderMetrics(
+            page_count=page_count,
+            fill_ratio=fill_ratio,
+            used_height=used_height,
+            available_height=AVAILABLE_HEIGHT,
+        )
+        logger.info(
+            "  Test render: %d page(s), fill %.0f%%",
+            metrics.page_count,
+            metrics.fill_ratio * 100,
+        )
+        return metrics
 
     def measure_fill_ratio(self, state: PipelineState) -> float:
         """Return how much of the usable page height the content fills (0.0–1.0).
@@ -246,15 +277,11 @@ class FormatterAgent:
 
     def _build_pdf(self, state: PipelineState, output) -> int:
         """Build the PDF to a file path or BytesIO buffer. Returns page count."""
-        doc = SimpleDocTemplate(
-            output,
-            pagesize=letter,
-            leftMargin=MARGIN_LEFT,
-            rightMargin=MARGIN_RIGHT,
-            topMargin=MARGIN_TOP,
-            bottomMargin=MARGIN_BOTTOM,
-        )
+        story = self._build_story(state)
+        return self._build_story_to_output(story, output)
 
+    def _build_story(self, state: PipelineState) -> list:
+        """Build the ordered flowables used for both render and measurement."""
         story: list = []
 
         # ── Contact header ───────────────────────────────────────
@@ -268,6 +295,19 @@ class FormatterAgent:
             for section in state.pruned_sections:
                 story.extend(self._build_section(section))
 
+        return story
+
+    def _build_story_to_output(self, story: list, output) -> int:
+        """Build a preconstructed story to a file path or BytesIO buffer."""
+        doc = SimpleDocTemplate(
+            output,
+            pagesize=letter,
+            leftMargin=MARGIN_LEFT,
+            rightMargin=MARGIN_RIGHT,
+            topMargin=MARGIN_TOP,
+            bottomMargin=MARGIN_BOTTOM,
+        )
+
         # ── Build and capture page count ─────────────────────────
         page_counter = _PageCounter()
         doc.build(
@@ -276,6 +316,19 @@ class FormatterAgent:
             onLaterPages=page_counter.on_page,
         )
         return page_counter.count
+
+    def _measure_story_height(self, story: list) -> float:
+        """Estimate consumed vertical space using ReportLab flowable heights."""
+        used_height = 0.0
+        for flowable in story:
+            width, height = flowable.wrap(CONTENT_WIDTH, AVAILABLE_HEIGHT)
+            del width
+            used_height += float(height)
+            if hasattr(flowable, "getSpaceBefore"):
+                used_height += float(flowable.getSpaceBefore())
+            if hasattr(flowable, "getSpaceAfter"):
+                used_height += float(flowable.getSpaceAfter())
+        return used_height
 
     # ── Contact extraction ───────────────────────────────────────
 
@@ -318,7 +371,6 @@ class FormatterAgent:
             # ── Contact: line with | or @ ─────────────────────────
             if ("|" in stripped or "@" in stripped) and not contact_html:
                 raw = re.sub(r"\*\*|\*|__|_", "", stripped)
-                print(f"DEBUG CONTACT RAW LINE: {repr(raw)}")
 
                 # Build contact parts deterministically
                 parts: list[str] = []
@@ -326,7 +378,6 @@ class FormatterAgent:
                     segment = segment.strip()
                     if not segment:
                         continue
-                    print(f"DEBUG CONTACT SEGMENT: {repr(segment)}")
 
                     # 1) Markdown link: [Text](URL)
                     md_match = re.match(
@@ -334,7 +385,6 @@ class FormatterAgent:
                     )
                     if md_match:
                         label, url = md_match.group(1), md_match.group(2).strip()
-                        print(f"DEBUG CONTACT MD LINK: label={repr(label)}, url={repr(url)}")
                         if url and url != "#":
                             # Ensure URL has a scheme
                             if not re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", url):
@@ -345,7 +395,6 @@ class FormatterAgent:
                         else:
                             # Placeholder link (#) — render as plain text
                             parts.append(segment.replace("[", "").split("]")[0])
-                        print(f"DEBUG CONTACT RESULT: {repr(parts[-1])}")
                         continue
 
                     # 2) Bare email address
@@ -358,15 +407,12 @@ class FormatterAgent:
                             f'<a href="mailto:{email}" color="blue">'
                             f"<u>{email}</u></a>"
                         )
-                        print(f"DEBUG CONTACT EMAIL: {repr(parts[-1])}")
                         continue
 
                     # 3) Plain text (city, phone, etc.)
                     parts.append(segment)
-                    print(f"DEBUG CONTACT PLAIN: {repr(segment)}")
 
                 contact_html = "  |  ".join(parts)
-                print(f"DEBUG CONTACT FINAL HTML: {repr(contact_html)}")
 
             if name and contact_html:
                 break
@@ -430,8 +476,6 @@ class FormatterAgent:
                 "College of Literature, Science, and the Arts",
                 "College of LSA",
             )
-            print(f"DEBUG EDU TITLE BEFORE: {repr(entry.title)}")
-            print(f"DEBUG EDU TITLE AFTER:  {repr(edu_title)}")
             elements.append(
                 Paragraph(
                     _sanitize_text(self._esc(edu_title)),

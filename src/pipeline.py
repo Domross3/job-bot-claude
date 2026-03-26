@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
 import re
 from pathlib import Path
@@ -21,6 +22,23 @@ logger = logging.getLogger(__name__)
 
 # ── Regex for extracting numbers (handles negatives, decimals, comma groups) ──
 _NUMBER_RE = re.compile(r"-?\d+(?:,\d{3})*(?:\.\d+)?")
+_TARGET_PAGE_FILL_RATIO = 0.95
+_MAX_DETERMINISTIC_PRUNE_STEPS = 24
+_MIN_WORK_BULLETS = 3
+_MIN_EDUCATION_BULLETS = 2
+_MIN_PROJECT_BULLETS = 1
+
+
+@dataclass(frozen=True)
+class _PruneCandidate:
+    """A single removable unit considered by the deterministic prune loop."""
+
+    kind: str
+    section_index: int
+    entry_index: int
+    bullet_index: int | None
+    penalty: float
+    label: str
 
 
 def _extract_numbers(text: str) -> set[str]:
@@ -47,7 +65,7 @@ class Pipeline:
 
     Flow:
       Analyzer → Mapper → Pruner → Critic
-        → Render-and-Refine loop (test render → overflow? → re-prune)
+        → Render-and-Refine loop (test render → overflow? → local prune)
         → HITL gate (1-page confirmed)
         → Formatter saves final PDF
     """
@@ -104,6 +122,7 @@ class Pipeline:
                 update={
                     "revision_count": state.revision_count + 1,
                     "overflow_pages": None,
+                    "last_render_fill_ratio": None,
                     "render_iteration": 0,
                 }
             )
@@ -290,93 +309,51 @@ class Pipeline:
 
         return issues
 
-    # Minimum page fill ratio — drafts below this get sent back for more content
-    CONTENT_FLOOR_RATIO = 0.80
-    MAX_CONTENT_FLOOR_RETRIES = 2
-
     def _render_and_refine(self, state: PipelineState) -> PipelineState:
-        """Test render → if overflow → re-prune; if underfill → re-map.
-
-        Checks both directions:
-          - Overflow (>1 page): re-prune to cut content
-          - Underfill (<80% fill): re-map to add content
-
-        Returns state with confirmed single-page, well-filled content.
-        """
+        """Measure the draft, then prune overflow locally without extra LLM calls."""
         logger.info("▶ Starting render-and-refine loop")
-
-        for iteration in range(1, state.max_render_iterations + 1):
-            state = self._enforce_project_retention(state)
-            page_count = self.formatter.test_render(state)
-            state = state.model_copy(update={"last_render_page_count": page_count})
-
-            if page_count <= 1:
-                # Check content floor — is the page full enough?
-                fill_ratio = self.formatter.measure_fill_ratio(state)
-                if fill_ratio < self.CONTENT_FLOOR_RATIO:
-                    state = self._enforce_content_floor(state, fill_ratio)
-                    # Re-check after adding content (might overflow now)
-                    continue
-
-                logger.info("  ✔ Render fits in 1 page (%.0f%% fill)", fill_ratio * 100)
-                state = state.model_copy(
-                    update={
-                        "overflow_pages": None,
-                        "render_iteration": 0,
-                        "last_render_page_count": page_count,
-                    }
-                )
-                return state
-
-            # Overflow detected — estimate how far over
-            overflow_estimate = page_count  # e.g. 2 pages = ~1.x actual
-            # For a more precise estimate we'd measure content height,
-            # but page_count is sufficient for the Pruner's instructions
-            overflow_ratio = 1.0 + (0.3 * iteration)  # escalating estimate
-
-            logger.warning(
-                "  ⚠ Overflow: %d pages (iteration %d/%d) — re-pruning",
-                page_count,
-                iteration,
-                state.max_render_iterations,
-            )
-            print(
-                f"\n  ⚠  Render overflow: {page_count} pages — "
-                f"re-pruning (iteration {iteration}/{state.max_render_iterations})"
-            )
-
-            state = state.model_copy(
-                update={
-                    "overflow_pages": overflow_ratio,
-                    "render_iteration": iteration,
-                }
-            )
-            state = self.pruner.run(state)
-            state = state.model_copy(
-                update={
-                    "pruned_sections": normalize_project_sections(
-                        state.pruned_sections,
-                        state.source_projects,
-                        max_bullets_per_project=3,
-                    )
-                }
-            )
-
-        # If we exhausted iterations, proceed with whatever we have
         state = self._enforce_project_retention(state)
-        final_pages = self.formatter.test_render(state)
-        if final_pages > 1:
-            print(
-                f"\n  ⚠  Could not fit to 1 page after {state.max_render_iterations} "
-                f"iterations ({final_pages} pages). Proceeding with best draft."
-            )
+        metrics = self.formatter.measure_render(state)
+        state = state.model_copy(
+            update={
+                "last_render_page_count": metrics.page_count,
+                "last_render_fill_ratio": metrics.fill_ratio,
+                "overflow_pages": None,
+                "render_iteration": 0,
+            }
+        )
+
+        if metrics.page_count <= 1:
+            logger.info("  ✔ Render fits in 1 page (fill %.0f%%)", metrics.fill_ratio * 100)
+            return state
+
+        logger.warning(
+            "  ⚠ Overflow detected: %d pages (fill %.0f%%) — pruning locally",
+            metrics.page_count,
+            metrics.fill_ratio * 100,
+        )
+        print(
+            f"\n  ⚠  Render overflow: {metrics.page_count} pages "
+            f"({metrics.fill_ratio * 100:.0f}% fill) — pruning locally"
+        )
+
+        state = self._prune_to_fit_deterministically(state, metrics)
+        state = self._enforce_project_retention(state)
+
+        final_metrics = self.formatter.measure_render(state)
         state = state.model_copy(
             update={
                 "overflow_pages": None,
                 "render_iteration": 0,
-                "last_render_page_count": final_pages,
+                "last_render_page_count": final_metrics.page_count,
+                "last_render_fill_ratio": final_metrics.fill_ratio,
             }
         )
+        if final_metrics.page_count > 1:
+            print(
+                f"\n  ⚠  Could not fit to 1 page after {_MAX_DETERMINISTIC_PRUNE_STEPS} "
+                f"deterministic prune steps ({final_metrics.page_count} pages)."
+            )
         return state
 
     def _enforce_content_floor(self, state: PipelineState, fill_ratio: float) -> PipelineState:
@@ -513,6 +490,276 @@ class Pipeline:
             )
 
         return state
+
+    def _prune_to_fit_deterministically(
+        self,
+        state: PipelineState,
+        metrics,
+    ) -> PipelineState:
+        """Trim overflow locally using real render metrics instead of more LLM calls."""
+        current_state = state
+        current_metrics = metrics
+
+        for step in range(1, _MAX_DETERMINISTIC_PRUNE_STEPS + 1):
+            if current_metrics.page_count <= 1:
+                return current_state
+
+            candidates = self._enumerate_prune_candidates(current_state.pruned_sections)
+            if not candidates:
+                logger.warning("  ⚠ Deterministic prune stopped: no removable units remain")
+                break
+
+            options = []
+
+            for candidate in candidates:
+                candidate_sections = self._apply_prune_candidate(
+                    current_state.pruned_sections,
+                    candidate,
+                )
+                candidate_state = current_state.model_copy(
+                    update={"pruned_sections": candidate_sections}
+                )
+                candidate_metrics = self.formatter.measure_render(candidate_state)
+                if not self._candidate_improves(current_metrics, candidate_metrics):
+                    continue
+                options.append((candidate, candidate_sections, candidate_metrics))
+
+            if not options:
+                logger.warning("  ⚠ Deterministic prune stopped: no candidate improved overflow")
+                break
+
+            best_candidate, best_sections, best_metrics = self._select_best_candidate(
+                options
+            )
+
+            current_state = current_state.model_copy(
+                update={
+                    "pruned_sections": best_sections,
+                    "last_render_page_count": best_metrics.page_count,
+                    "last_render_fill_ratio": best_metrics.fill_ratio,
+                    "render_iteration": step,
+                    "overflow_pages": None,
+                }
+            )
+            current_metrics = best_metrics
+
+            logger.info(
+                "  ✔ Deterministic prune step %d: %s -> %d page(s), fill %.0f%%",
+                step,
+                best_candidate.label,
+                best_metrics.page_count,
+                best_metrics.fill_ratio * 100,
+            )
+            print(
+                f"     → Local prune {step}: {best_candidate.label} "
+                f"→ {best_metrics.page_count} page(s), {best_metrics.fill_ratio * 100:.0f}% fill"
+            )
+
+        return current_state
+
+    def _enumerate_prune_candidates(self, sections) -> list[_PruneCandidate]:
+        """Return removable units ordered by semantic cost, not just size."""
+        candidates: list[_PruneCandidate] = []
+        if not sections:
+            return candidates
+
+        for section_index, section in enumerate(sections):
+            section_kind = self._section_kind(section.heading)
+            for entry_index, entry in enumerate(section.entries):
+                bullets = entry.bullets or []
+                relevance = entry.relevance_score if entry.relevance_score is not None else 0.5
+
+                if section_kind == "skills":
+                    for bullet_index in range(len(bullets) - 1, -1, -1):
+                        candidates.append(
+                            _PruneCandidate(
+                                kind="skills_line",
+                                section_index=section_index,
+                                entry_index=entry_index,
+                                bullet_index=bullet_index,
+                                penalty=1.0 + (0.1 * bullet_index),
+                                label=f"remove skills line {bullet_index + 1}",
+                            )
+                        )
+                    continue
+
+                if section_kind == "education":
+                    for bullet_index in range(
+                        len(bullets) - 1,
+                        _MIN_EDUCATION_BULLETS - 1,
+                        -1,
+                    ):
+                        bullet_text = bullets[bullet_index]
+                        candidates.append(
+                            _PruneCandidate(
+                                kind="education_bullet",
+                                section_index=section_index,
+                                entry_index=entry_index,
+                                bullet_index=bullet_index,
+                                penalty=self._education_bullet_penalty(bullet_text),
+                                label=f"trim education bullet {bullet_index + 1}",
+                            )
+                        )
+                    continue
+
+                if section_kind == "projects":
+                    for bullet_index in range(
+                        len(bullets) - 1,
+                        _MIN_PROJECT_BULLETS - 1,
+                        -1,
+                    ):
+                        candidates.append(
+                            _PruneCandidate(
+                                kind="project_bullet",
+                                section_index=section_index,
+                                entry_index=entry_index,
+                                bullet_index=bullet_index,
+                                penalty=4.0 + (2.5 * relevance),
+                                label=f"trim project bullet {bullet_index + 1} from {entry.title}",
+                            )
+                        )
+                    continue
+
+                if section_kind == "work":
+                    for bullet_index in range(
+                        len(bullets) - 1,
+                        _MIN_WORK_BULLETS - 1,
+                        -1,
+                    ):
+                        position_penalty = 0.5 if bullet_index >= 2 else 2.0
+                        candidates.append(
+                            _PruneCandidate(
+                                kind="work_bullet",
+                                section_index=section_index,
+                                entry_index=entry_index,
+                                bullet_index=bullet_index,
+                                penalty=6.0 + position_penalty + (4.0 * relevance),
+                                label=f"trim work bullet {bullet_index + 1} from {entry.title}",
+                            )
+                        )
+
+                    if len(section.entries) > 3:
+                        candidates.append(
+                            _PruneCandidate(
+                                kind="work_entry",
+                                section_index=section_index,
+                                entry_index=entry_index,
+                                bullet_index=None,
+                                penalty=18.0 + (8.0 * relevance),
+                                label=f"remove work entry {entry.title}",
+                            )
+                        )
+
+        return candidates
+
+    @staticmethod
+    def _candidate_improves(current_metrics, candidate_metrics) -> bool:
+        """Accept candidates that reduce page count or meaningfully shrink overflow."""
+        return (
+            candidate_metrics.page_count < current_metrics.page_count
+            or candidate_metrics.fill_ratio < (current_metrics.fill_ratio - 1e-6)
+        )
+
+    @staticmethod
+    def _select_best_candidate(options):
+        """Prefer the fullest fitting draft; otherwise take the strongest overflow cut."""
+        fitting = [option for option in options if option[2].page_count <= 1]
+        if fitting:
+            return min(
+                fitting,
+                key=lambda option: (
+                    abs(option[2].fill_ratio - _TARGET_PAGE_FILL_RATIO),
+                    option[0].penalty,
+                ),
+            )
+
+        return min(
+            options,
+            key=lambda option: (
+                option[2].page_count,
+                option[2].fill_ratio,
+                option[0].penalty,
+            ),
+        )
+
+    def _apply_prune_candidate(self, sections, candidate: _PruneCandidate) -> list[ResumeSection]:
+        """Apply one local trim and return a cleaned copy of the sections."""
+        cloned_sections = [section.model_copy(deep=True) for section in sections or []]
+        section = cloned_sections[candidate.section_index]
+
+        if candidate.kind == "work_entry":
+            del section.entries[candidate.entry_index]
+            return self._cleanup_sections(cloned_sections)
+
+        entry = section.entries[candidate.entry_index]
+        if candidate.bullet_index is not None:
+            del entry.bullets[candidate.bullet_index]
+
+        return self._cleanup_sections(cloned_sections)
+
+    def _cleanup_sections(self, sections) -> list[ResumeSection]:
+        """Drop empty skills entries/sections after a local prune step."""
+        cleaned_sections: list[ResumeSection] = []
+        for section in sections or []:
+            section_kind = self._section_kind(section.heading)
+            cleaned_entries = []
+            for entry in section.entries:
+                cleaned_bullets = [bullet for bullet in entry.bullets if bullet.strip()]
+                if section_kind == "skills" and not cleaned_bullets:
+                    continue
+                cleaned_entries.append(entry.model_copy(update={"bullets": cleaned_bullets}))
+
+            if cleaned_entries:
+                cleaned_sections.append(section.model_copy(update={"entries": cleaned_entries}))
+
+        return cleaned_sections
+
+    @staticmethod
+    def _section_kind(heading: str) -> str:
+        """Map a human heading to a stable section kind."""
+        heading_lower = heading.lower()
+        if "skill" in heading_lower:
+            return "skills"
+        if "edu" in heading_lower:
+            return "education"
+        if "project" in heading_lower:
+            return "projects"
+        if "experience" in heading_lower or "work" in heading_lower:
+            return "work"
+        return "other"
+
+    @staticmethod
+    def _education_bullet_penalty(text: str) -> float:
+        """Protect GPA, honors, and named awards before generic coursework bullets."""
+        normalized = text.lower()
+        protected_terms = (
+            "gpa",
+            "honor",
+            "scholar",
+            "award",
+            "fellow",
+            "dean",
+            "gilman",
+            "s-stem",
+        )
+        return 4.0 + (2.0 if any(term in normalized for term in protected_terms) else 0.0)
+
+    def _find_sparse_work_entries(self, sections, min_bullets: int) -> list[str]:
+        """Return work entries that violate the soft bullet floor."""
+        violations: list[str] = []
+        if not sections:
+            return violations
+
+        for section in sections:
+            if self._section_kind(section.heading) != "work":
+                continue
+            for entry in section.entries:
+                if len(entry.bullets) < min_bullets:
+                    violations.append(
+                        f"{entry.title} has {len(entry.bullets)} bullets (minimum {min_bullets})"
+                    )
+
+        return violations
 
     @staticmethod
     def _get_project_entries(sections) -> list:
