@@ -17,7 +17,7 @@ system_prompt: |
 
   {
     "job_title": "string",
-    "company_name": "string",
+    "company_name": "string or null",
     "hard_skills": ["string"],
     "soft_skills": ["string"],
     "key_phrases": ["string"],

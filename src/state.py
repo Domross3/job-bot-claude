@@ -9,7 +9,7 @@ class JDAnalysis(BaseModel):
     """Structured extraction of a Job Description."""
 
     job_title: str
-    company_name: str
+    company_name: str | None = None
     hard_skills: list[str] = Field(
         description='Explicit technical skills, e.g. ["Python", "Kubernetes"]'
     )

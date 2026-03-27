@@ -1245,8 +1245,9 @@ class Pipeline:
         if not state.analysis:
             return
         a = state.analysis
+        employer = a.company_name or "Unknown company"
         print("\n" + "-" * 70)
-        print(f"  JD Analysis: {a.job_title} @ {a.company_name}")
+        print(f"  JD Analysis: {a.job_title} @ {employer}")
         print(f"  Hard skills: {', '.join(a.hard_skills[:10])}")
         print(f"  Soft skills: {', '.join(a.soft_skills[:5])}")
         if a.experience_years:
