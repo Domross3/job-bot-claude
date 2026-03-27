@@ -12,12 +12,20 @@ class CriticAgent(BaseAgent):
         return "critic"
 
     def _build_prompt(self, state: PipelineState) -> str:
-        pruned_json = (
-            "[" + ", ".join(s.model_dump_json() for s in state.pruned_sections) + "]"
-            if state.pruned_sections
-            else "[]"
+        return "\n".join(
+            [
+                self._stable_prefix_text(state),
+                self._dynamic_draft_text(state),
+            ]
         )
 
+    def _build_message_content(self, state: PipelineState):
+        return [
+            self._text_block(self._stable_prefix_text(state), cache=True),
+            self._text_block(self._dynamic_draft_text(state)),
+        ]
+
+    def _stable_prefix_text(self, state: PipelineState) -> str:
         analysis_json = (
             state.analysis.model_dump_json(indent=2) if state.analysis else "{}"
         )
@@ -30,7 +38,16 @@ class CriticAgent(BaseAgent):
             "=== END JD ANALYSIS ===\n\n"
             "=== MASTER RESUME (original source of truth) ===\n"
             f"{state.master_resume}\n"
-            "=== END MASTER RESUME ===\n\n"
+            "=== END MASTER RESUME ==="
+        )
+
+    def _dynamic_draft_text(self, state: PipelineState) -> str:
+        pruned_json = (
+            "[" + ", ".join(s.model_dump_json() for s in state.pruned_sections) + "]"
+            if state.pruned_sections
+            else "[]"
+        )
+        return (
             "=== TAILORED DRAFT (to evaluate) ===\n"
             f"{pruned_json}\n"
             "=== END TAILORED DRAFT ==="

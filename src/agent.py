@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 from abc import ABC, abstractmethod
@@ -22,6 +23,35 @@ logger = logging.getLogger(__name__)
 CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
 MODELS_PATH = CONFIG_DIR / "models.yaml"
 PROMPTS_DIR = CONFIG_DIR / "prompts"
+ENABLE_VISIBLE_REASONING = os.getenv("ENABLE_VISIBLE_REASONING", "").lower() in {"1", "true", "yes", "on"}
+ENABLE_PROMPT_CACHING = os.getenv("ENABLE_PROMPT_CACHING", "1").lower() in {"1", "true", "yes", "on"}
+
+_MODEL_PRICING: list[tuple[str, dict[str, float]]] = [
+    (
+        "claude-opus-4-6",
+        {"input": 5.0, "cache_write": 6.25, "cache_read": 0.50, "output": 25.0},
+    ),
+    (
+        "claude-opus-4-5",
+        {"input": 5.0, "cache_write": 6.25, "cache_read": 0.50, "output": 25.0},
+    ),
+    (
+        "claude-sonnet-4-6",
+        {"input": 3.0, "cache_write": 3.75, "cache_read": 0.30, "output": 15.0},
+    ),
+    (
+        "claude-sonnet-4-5",
+        {"input": 3.0, "cache_write": 3.75, "cache_read": 0.30, "output": 15.0},
+    ),
+    (
+        "claude-sonnet-4",
+        {"input": 3.0, "cache_write": 3.75, "cache_read": 0.30, "output": 15.0},
+    ),
+    (
+        "claude-haiku-4-5",
+        {"input": 1.0, "cache_write": 1.25, "cache_read": 0.10, "output": 5.0},
+    ),
+]
 
 
 @dataclass(frozen=True)
@@ -41,6 +71,40 @@ class TaggedResponse:
 
     thinking: str
     answer: str
+
+
+@dataclass(frozen=True)
+class UsageSummary:
+    """Anthropic token/cost accounting for one agent call."""
+
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cache_creation_input_tokens: int
+    cache_read_input_tokens: int
+    estimated_cost_usd: float | None
+    duration_ms: int
+
+
+def _effective_system_prompt(system_prompt: str) -> str:
+    """Disable visible reasoning in production while preserving <answer> tags."""
+    if ENABLE_VISIBLE_REASONING:
+        return system_prompt
+
+    return (
+        f"{system_prompt.rstrip()}\n\n"
+        "PRODUCTION MODE:\n"
+        "- Do NOT include any <thinking> tags.\n"
+        "- Do NOT include reasoning summaries.\n"
+        "- Put your final output entirely inside <answer> tags.\n"
+    )
+
+
+def _pricing_for_model(model: str) -> dict[str, float] | None:
+    for prefix, pricing in _MODEL_PRICING:
+        if model.startswith(prefix):
+            return pricing
+    return None
 
 
 def load_agent_config(agent_name: str) -> AgentConfig:
@@ -63,7 +127,7 @@ def load_agent_config(agent_name: str) -> AgentConfig:
         model=model_cfg["model"],
         temperature=model_cfg.get("temperature", 0.0),
         max_tokens=model_cfg.get("max_tokens", 4096),
-        system_prompt=prompt_cfg["system_prompt"],
+        system_prompt=_effective_system_prompt(prompt_cfg["system_prompt"]),
     )
 
 
@@ -79,6 +143,7 @@ class BaseAgent(ABC):
             config = load_agent_config(self.agent_name)
         self.config = config
         self.client = anthropic.Anthropic()
+        self.last_usage: UsageSummary | None = None
 
     # ── Subclass contract ────────────────────────────────────────
 
@@ -102,10 +167,10 @@ class BaseAgent(ABC):
     def run(self, state: PipelineState) -> PipelineState:
         """Execute the agent: build prompt → call LLM → parse → update state."""
         logger.info("▶ Running %s agent [%s]", self.config.name, self.config.model)
-        user_message = self._build_prompt(state)
-        raw_response = self._call_llm(user_message)
+        user_content = self._build_message_content(state)
+        raw_response = self._call_llm(user_content)
         tagged = self._extract_tagged_response(raw_response)
-        if tagged.thinking:
+        if tagged.thinking and ENABLE_VISIBLE_REASONING:
             logger.info("%s reasoning summary:\n%s", self.config.name, tagged.thinking)
             print(
                 f"\n  [{self.config.name} reasoning summary]\n"
@@ -118,16 +183,29 @@ class BaseAgent(ABC):
 
     # ── LLM interaction ──────────────────────────────────────────
 
-    def _call_llm(self, user_message: str, retry_count: int = 0) -> str:
+    def _build_message_content(self, state: PipelineState) -> str | list[dict[str, Any]]:
+        """Return either a single user string or structured content blocks."""
+        return self._build_prompt(state)
+
+    @staticmethod
+    def _text_block(text: str, *, cache: bool = False) -> dict[str, Any]:
+        """Build a Messages API text block, optionally marking it cacheable."""
+        block: dict[str, Any] = {"type": "text", "text": text}
+        if cache and ENABLE_PROMPT_CACHING and text.strip():
+            block["cache_control"] = {"type": "ephemeral"}
+        return block
+
+    def _call_llm(self, user_content: str | list[dict[str, Any]], retry_count: int = 0) -> str:
         """Call Anthropic API with exponential backoff (max 3 retries)."""
         max_retries = 3
+        start = time.time()
         try:
             request_kwargs = {
                 "model": self.config.model,
                 "max_tokens": self.config.max_tokens,
                 "temperature": self.config.temperature,
                 "system": self.config.system_prompt,
-                "messages": [{"role": "user", "content": user_message}],
+                "messages": [{"role": "user", "content": user_content}],
             }
             # NOTE: Adaptive thinking (API-level) is NOT used. We rely on
             # prompt-level <thinking>/<answer> tags instead, which work on
@@ -155,11 +233,45 @@ class BaseAgent(ABC):
                     )
 
             text = "\n".join(part for part in text_parts if part).strip()
+            input_tokens = int(getattr(response.usage, "input_tokens", 0) or 0)
+            output_tokens = int(getattr(response.usage, "output_tokens", 0) or 0)
+            cache_creation_input_tokens = int(
+                getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+            )
+            cache_read_input_tokens = int(
+                getattr(response.usage, "cache_read_input_tokens", 0) or 0
+            )
+            duration_ms = int((time.time() - start) * 1000)
+            estimated_cost_usd = self._estimate_cost_usd(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_creation_input_tokens=cache_creation_input_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
+            )
+            self.last_usage = UsageSummary(
+                model=self.config.model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_creation_input_tokens=cache_creation_input_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
+                estimated_cost_usd=estimated_cost_usd,
+                duration_ms=duration_ms,
+            )
             logger.debug(
                 "%s token usage: input=%d output=%d",
                 self.config.name,
-                response.usage.input_tokens,
-                response.usage.output_tokens,
+                input_tokens,
+                output_tokens,
+            )
+            logger.info(
+                "%s usage: input=%d cache_write=%d cache_read=%d output=%d est_cost=%s duration=%dms",
+                self.config.name,
+                input_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                output_tokens,
+                f"${estimated_cost_usd:.4f}" if estimated_cost_usd is not None else "n/a",
+                duration_ms,
             )
             return text
 
@@ -175,7 +287,7 @@ class BaseAgent(ABC):
                 max_retries,
             )
             time.sleep(wait)
-            return self._call_llm(user_message, retry_count + 1)
+            return self._call_llm(user_content, retry_count + 1)
 
         except anthropic.APIError as e:
             if retry_count >= max_retries:
@@ -190,7 +302,26 @@ class BaseAgent(ABC):
                 max_retries,
             )
             time.sleep(wait)
-            return self._call_llm(user_message, retry_count + 1)
+            return self._call_llm(user_content, retry_count + 1)
+
+    def _estimate_cost_usd(
+        self,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+        cache_creation_input_tokens: int,
+        cache_read_input_tokens: int,
+    ) -> float | None:
+        pricing = _pricing_for_model(self.config.model)
+        if pricing is None:
+            return None
+
+        return (
+            (input_tokens / 1_000_000) * pricing["input"]
+            + (cache_creation_input_tokens / 1_000_000) * pricing["cache_write"]
+            + (cache_read_input_tokens / 1_000_000) * pricing["cache_read"]
+            + (output_tokens / 1_000_000) * pricing["output"]
+        )
 
     # ── JSON helpers ─────────────────────────────────────────────
 
@@ -251,8 +382,8 @@ class BaseAgent(ABC):
                 "Your previous <answer> block was not valid JSON. "
                 "Here is the error:\n\n"
                 f"{e}\n\n"
-                "Return an optional brief <thinking> summary plus the corrected "
-                "JSON entirely inside <answer> tags."
+                "Return the corrected JSON entirely inside <answer> tags. "
+                "Do not include markdown."
             )
             retry_raw = self._call_llm(fix_prompt)
             cleaned = self._extract_json(retry_raw)

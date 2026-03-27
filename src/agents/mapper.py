@@ -14,6 +14,20 @@ class MapperAgent(BaseAgent):
         return "mapper"
 
     def _build_prompt(self, state: PipelineState) -> str:
+        parts = [self._stable_prefix_text(state)]
+        dynamic = self._dynamic_feedback_text(state)
+        if dynamic:
+            parts.append(dynamic)
+        return "\n".join(parts)
+
+    def _build_message_content(self, state: PipelineState):
+        blocks = [self._text_block(self._stable_prefix_text(state), cache=True)]
+        dynamic = self._dynamic_feedback_text(state)
+        if dynamic:
+            blocks.append(self._text_block(dynamic))
+        return blocks
+
+    def _stable_prefix_text(self, state: PipelineState) -> str:
         source_bullets_json = (
             "[" + ", ".join(b.model_dump_json() for b in state.source_bullets) + "]"
             if state.source_bullets
@@ -33,22 +47,31 @@ class MapperAgent(BaseAgent):
             "=== END SOURCE BULLET INVENTORY ===",
         ]
 
-        # If this is a revision loop, inject Critic feedback as constraints
-        if state.evaluation and not state.evaluation.approved:
-            parts.append("\n=== CRITIC FEEDBACK (you MUST address these issues) ===")
-            parts.append(f"Factual drift issues: {json.dumps(state.evaluation.factual_drift_issues)}")
-            parts.append(f"Missing keywords: {json.dumps(state.evaluation.missing_keywords)}")
-            parts.append(f"Suggestions: {json.dumps(state.evaluation.suggestions)}")
-            parts.append("=== END CRITIC FEEDBACK ===")
+        return "\n".join(parts)
 
-            # Include the current draft so the mapper can expand on it
-            # rather than starting from scratch and potentially producing less
-            current_draft = state.pruned_sections or state.mapped_sections
-            if current_draft:
-                draft_json = "[" + ", ".join(s.model_dump_json() for s in current_draft) + "]"
-                parts.append("\n=== CURRENT DRAFT (for context only; keep scoring all source bullets) ===")
-                parts.append(draft_json)
-                parts.append("=== END CURRENT DRAFT ===")
+    def _dynamic_feedback_text(self, state: PipelineState) -> str:
+        if not (state.evaluation and not state.evaluation.approved):
+            return ""
+
+        parts = [
+            "=== CRITIC FEEDBACK (you MUST address these issues) ===",
+            f"Factual drift issues: {json.dumps(state.evaluation.factual_drift_issues)}",
+            f"Missing keywords: {json.dumps(state.evaluation.missing_keywords)}",
+            f"Suggestions: {json.dumps(state.evaluation.suggestions)}",
+            "=== END CRITIC FEEDBACK ===",
+        ]
+
+        current_draft = state.pruned_sections or state.mapped_sections
+        if current_draft:
+            draft_json = "[" + ", ".join(s.model_dump_json() for s in current_draft) + "]"
+            parts.extend(
+                [
+                    "",
+                    "=== CURRENT DRAFT (for context only; keep scoring all source bullets) ===",
+                    draft_json,
+                    "=== END CURRENT DRAFT ===",
+                ]
+            )
 
         return "\n".join(parts)
 
