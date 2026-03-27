@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 # ── Regex for extracting numbers (handles negatives, decimals, comma groups) ──
 _NUMBER_RE = re.compile(r"-?\d+(?:,\d{3})*(?:\.\d+)?")
+_METRIC_RE = re.compile(r"(?:\d|%|\$)")
 _TARGET_PAGE_FILL_RATIO = 0.95
 _UNDERFILL_THRESHOLD = 0.80
 _MAX_DETERMINISTIC_PRUNE_STEPS = 24
@@ -33,23 +34,27 @@ _MAX_EXPAND_STEPS = 12
 _MIN_WORK_BULLETS = 3
 _MIN_EDUCATION_BULLETS = 2
 _MIN_PROJECT_BULLETS = 1
+_MAX_BULLET_LENGTH_BONUS_CHARS = 180
+_MAX_BULLET_LENGTH_BONUS = 0.08
+_METRIC_BONUS = 0.03
 
 
 @dataclass(frozen=True)
 class _PruneCandidate:
     """A single removable unit considered by the deterministic prune loop.
 
-    The sort key is (relevance_score, section_priority) where lower values
-    are removed first.  This means the least-relevant content gets cut
-    before more-relevant content, regardless of which section it lives in.
+    The sort key is (keep_score, section_priority) where lower values
+    are removed first.  ``keep_score`` is still relevance-dominant, but it
+    includes a small density bonus so longer, metric-rich bullets survive
+    tie-breaks more often than short generic lines.
     ``section_priority`` is only a tiebreaker when two candidates share the
-    same relevance score.
+    same keep score.
     """
 
     kind: str
     entry_id: str
     bullet_id: str | None
-    relevance: float          # the entry's relevance_score (0.0–1.0)
+    relevance: float          # relevance-dominant keep score (0.0–1.11)
     section_priority: float   # tiebreaker: skills=0, projects=1, education=2, work=3
     label: str
 
@@ -281,6 +286,7 @@ class Pipeline:
     def _select_initial_bullet_ids(self, state: PipelineState) -> list[str]:
         """Choose an initial dense draft from the full mapped bullet inventory."""
         score_lookup = {bullet.bullet_id: bullet.relevance_score for bullet in state.mapped_bullets}
+        text_lookup = self._bullet_text_lookup(state)
         selected: list[str] = []
 
         for section in state.source_sections:
@@ -301,6 +307,7 @@ class Pipeline:
                         self._pick_top_bullets(
                             entry,
                             score_lookup,
+                            text_lookup,
                             target=min(target, len(entry.bullet_ids)),
                         )
                     )
@@ -312,6 +319,7 @@ class Pipeline:
                         self._pick_top_bullets(
                             entry,
                             score_lookup,
+                            text_lookup,
                             target=min(4, len(entry.bullet_ids)),
                         )
                     )
@@ -323,6 +331,7 @@ class Pipeline:
                         self._pick_top_bullets(
                             entry,
                             score_lookup,
+                            text_lookup,
                             target=min(2, len(entry.bullet_ids)),
                         )
                     )
@@ -334,6 +343,7 @@ class Pipeline:
                         self._pick_top_bullets(
                             entry,
                             score_lookup,
+                            text_lookup,
                             target=min(4, len(entry.bullet_ids)),
                         )
                     )
@@ -352,6 +362,7 @@ class Pipeline:
                     self._pick_top_bullets(
                         entry,
                         score_lookup,
+                        text_lookup,
                         target=min(1, len(entry.bullet_ids)),
                     )
                 )
@@ -359,14 +370,22 @@ class Pipeline:
         return selected
 
     @staticmethod
-    def _pick_top_bullets(entry: ResumeEntry, score_lookup: dict[str, float], target: int) -> list[str]:
+    def _pick_top_bullets(
+        entry: ResumeEntry,
+        score_lookup: dict[str, float],
+        text_lookup: dict[str, str],
+        target: int,
+    ) -> list[str]:
         """Pick the strongest bullets for one entry, preserving source order."""
         if target <= 0:
             return []
 
         ranked = sorted(
             enumerate(entry.bullet_ids),
-            key=lambda pair: (score_lookup.get(pair[1], 0.0), -pair[0]),
+            key=lambda pair: (
+                Pipeline._bullet_keep_score(pair[1], score_lookup, text_lookup),
+                -pair[0],
+            ),
             reverse=True,
         )[:target]
         keep_ids = {bullet_id for _, bullet_id in ranked}
@@ -377,6 +396,33 @@ class Pipeline:
         if not entry.bullet_ids:
             return 0.0
         return max((score_lookup.get(bullet_id, 0.0) for bullet_id in entry.bullet_ids), default=0.0)
+
+    @staticmethod
+    def _bullet_text_lookup(state: PipelineState) -> dict[str, str]:
+        text_lookup = {
+            bullet.bullet_id: bullet.rewritten_text
+            for bullet in state.mapped_bullets
+        }
+        text_lookup.update(state.polished_bullet_texts)
+        return text_lookup
+
+    @staticmethod
+    def _contains_metric(text: str) -> bool:
+        return bool(_METRIC_RE.search(text or ""))
+
+    @staticmethod
+    def _bullet_keep_score(
+        bullet_id: str,
+        score_lookup: dict[str, float],
+        text_lookup: dict[str, str],
+    ) -> float:
+        """Rank bullets by relevance first, with small density tie-break bonuses."""
+        relevance = score_lookup.get(bullet_id, 0.0)
+        text = " ".join((text_lookup.get(bullet_id, "") or "").split())
+        length_bonus = min(len(text), _MAX_BULLET_LENGTH_BONUS_CHARS) / _MAX_BULLET_LENGTH_BONUS_CHARS
+        length_bonus *= _MAX_BULLET_LENGTH_BONUS
+        metric_bonus = _METRIC_BONUS if Pipeline._contains_metric(text) else 0.0
+        return relevance + length_bonus + metric_bonus
 
     def _assemble_sections_from_selection(
         self,
@@ -708,11 +754,13 @@ class Pipeline:
         score_lookup = {
             bullet.bullet_id: bullet.relevance_score for bullet in state.mapped_bullets
         }
+        text_lookup = self._bullet_text_lookup(state)
         for project_entry in missing_projects:
             selected.extend(
                 self._pick_top_bullets(
                     project_entry,
                     score_lookup,
+                    text_lookup,
                     target=min(max(_MIN_PROJECT_BULLETS, 1), len(project_entry.bullet_ids)),
                 )
             )
@@ -825,27 +873,40 @@ class Pipeline:
         return current_state
 
     def _enumerate_expand_candidates(self, state: PipelineState) -> list[dict]:
-        """Return omitted source bullets sorted by mapped relevance."""
+        """Return omitted source bullets sorted by keep score."""
         candidates: list[dict] = []
 
         selected_set = set(state.selected_bullet_ids)
         score_lookup = {
             bullet.bullet_id: bullet.relevance_score for bullet in state.mapped_bullets
         }
+        text_lookup = self._bullet_text_lookup(state)
 
         for source_bullet in state.source_bullets:
             if source_bullet.bullet_id in selected_set:
                 continue
+            keep_score = self._bullet_keep_score(
+                source_bullet.bullet_id,
+                score_lookup,
+                text_lookup,
+            )
             candidates.append(
                 {
                     "bullet_id": source_bullet.bullet_id,
                     "entry_id": source_bullet.entry_id,
                     "relevance": score_lookup.get(source_bullet.bullet_id, 0.0),
+                    "keep_score": keep_score,
                     "label": f"restore bullet in {source_bullet.title or source_bullet.section_heading}",
                 }
             )
 
-        candidates.sort(key=lambda candidate: (-candidate["relevance"], candidate["bullet_id"]))
+        candidates.sort(
+            key=lambda candidate: (
+                -candidate["keep_score"],
+                -candidate["relevance"],
+                candidate["bullet_id"],
+            )
+        )
         return candidates
 
     def _apply_expand_candidate(self, state: PipelineState, candidate: dict) -> PipelineState:
@@ -878,6 +939,7 @@ class Pipeline:
         score_lookup = {
             bullet.bullet_id: bullet.relevance_score for bullet in state.mapped_bullets
         }
+        text_lookup = self._bullet_text_lookup(state)
         selected_set = set(state.selected_bullet_ids)
 
         for section in state.source_sections:
@@ -924,7 +986,11 @@ class Pipeline:
                             kind=f"{section_kind}_bullet",
                             entry_id=entry.entry_id or "",
                             bullet_id=bullet_id,
-                            relevance=score_lookup.get(bullet_id, entry_relevance),
+                            relevance=self._bullet_keep_score(
+                                bullet_id,
+                                score_lookup,
+                                text_lookup,
+                            ),
                             section_priority=priority,
                             label=f"trim {section_kind} bullet from {entry.title}",
                         )

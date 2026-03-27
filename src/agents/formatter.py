@@ -22,7 +22,6 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
-from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.platypus import (
     HRFlowable,
     Paragraph,
@@ -591,11 +590,7 @@ class FormatterAgent:
         return tbl
 
     def _make_bullet(self, text: str) -> Paragraph:
-        """Create a single bullet-point paragraph with orphan-line detection.
-
-        If a bullet barely overflows onto a second line (< 20% fill on line 2),
-        shrink the font by 0.5pt to fit it on one line cleanly.
-        """
+        """Create a bullet paragraph with deterministic wrap-aware orphan handling."""
         # Strip <br> tags, literal \n strings, and all extra whitespace
         clean = re.sub(r'<br\s*/?>', ' ', text, flags=re.IGNORECASE)
         clean = clean.replace('\\n', ' ').replace('\n', ' ')
@@ -603,35 +598,67 @@ class FormatterAgent:
         clean = _sanitize_text(clean)
 
         style = self.styles["bullet"]
-        bullet_prefix = "\u2022  "
-        full_text = bullet_prefix + clean
+        paragraph = self._build_bullet_paragraph(clean, style)
+        line_fills = self._measure_paragraph_line_fills(paragraph, style)
 
-        # Measure rendered width to detect orphan lines
-        available = CONTENT_WIDTH - style.leftIndent
-        text_width = stringWidth(full_text, style.fontName, style.fontSize)
-
-        if text_width > available:
-            overflow = text_width - available
-            second_line_fill = overflow / available
-            if second_line_fill < 0.20:
-                # Orphan detected — use a slightly smaller font
+        # If the second line is just a tiny orphan, only accept a shrink that
+        # truly collapses the bullet back to one line. Otherwise keep wording
+        # intact and let upstream selection prefer denser factual bullets.
+        if len(line_fills) == 2 and line_fills[1] < 0.30:
+            for step in range(1, 3):
+                shrink = 0.25 * step
                 shrunk = ParagraphStyle(
-                    "BulletShrunk",
+                    f"BulletShrunk{step}",
                     parent=style,
-                    fontSize=style.fontSize - 0.5,
-                    leading=style.leading - 0.5,
+                    fontSize=style.fontSize - shrink,
+                    leading=style.leading - shrink,
                 )
-                markup = (
-                    f'<font color="{COLOR_BULLET.hexval()}">\u2022</font>'
-                    f"  {self._esc(clean)}"
-                )
-                return Paragraph(markup, shrunk)
+                candidate = self._build_bullet_paragraph(clean, shrunk)
+                candidate_fills = self._measure_paragraph_line_fills(candidate, shrunk)
+                if len(candidate_fills) == 1:
+                    return candidate
 
+        return paragraph
+
+    def _build_bullet_paragraph(self, text: str, style: ParagraphStyle) -> Paragraph:
         markup = (
             f'<font color="{COLOR_BULLET.hexval()}">\u2022</font>'
-            f"  {self._esc(clean)}"
+            f"  {self._esc(text)}"
         )
         return Paragraph(markup, style)
+
+    def _measure_paragraph_line_fills(
+        self,
+        paragraph: Paragraph,
+        style: ParagraphStyle,
+    ) -> list[float]:
+        """Return per-line fill ratios from ReportLab's actual wrapped layout."""
+        paragraph.wrap(CONTENT_WIDTH, AVAILABLE_HEIGHT)
+        lines = getattr(getattr(paragraph, "blPara", None), "lines", None) or []
+        if not lines:
+            return []
+
+        first_line_width = max(CONTENT_WIDTH - style.leftIndent - style.firstLineIndent, 1)
+        later_line_width = max(CONTENT_WIDTH - style.leftIndent, 1)
+
+        fills: list[float] = []
+        for idx, line in enumerate(lines):
+            extra_space = self._extract_line_extra_space(line)
+            if extra_space is None:
+                continue
+            available = first_line_width if idx == 0 else later_line_width
+            fill_ratio = 1.0 - (extra_space / available)
+            fills.append(max(0.0, min(1.0, fill_ratio)))
+
+        return fills
+
+    @staticmethod
+    def _extract_line_extra_space(line) -> float | None:
+        if isinstance(line, tuple) and line and isinstance(line[0], (int, float)):
+            return float(line[0])
+        if hasattr(line, "extraSpace") and isinstance(line.extraSpace, (int, float)):
+            return float(line.extraSpace)
+        return None
 
     @staticmethod
     def _esc(text: str) -> str:
