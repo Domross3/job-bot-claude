@@ -704,14 +704,23 @@ class Pipeline:
             "\n  ✖  Project retention guardrail restoring missing project(s): "
             f"{missing_labels or 'source projects'}"
         )
-        state = state.model_copy(
-            update={
-                "pruned_sections": self._restore_missing_projects(
-                    state.pruned_sections,
-                    state.source_projects,
+        selected = list(state.selected_bullet_ids)
+        score_lookup = {
+            bullet.bullet_id: bullet.relevance_score for bullet in state.mapped_bullets
+        }
+        for project_entry in missing_projects:
+            selected.extend(
+                self._pick_top_bullets(
+                    project_entry,
+                    score_lookup,
+                    target=min(max(_MIN_PROJECT_BULLETS, 1), len(project_entry.bullet_ids)),
                 )
-            }
-        )
+            )
+
+        ordered_selected = self._sort_selected_bullet_ids(state, selected)
+        next_state = state.model_copy(update={"selected_bullet_ids": ordered_selected})
+        rebuilt_sections = self._assemble_sections_from_selection(next_state, ordered_selected)
+        state = next_state.model_copy(update={"pruned_sections": rebuilt_sections})
 
         return state
 
@@ -737,23 +746,21 @@ class Pipeline:
 
             for candidate in candidates:
                 candidate_state = self._apply_prune_candidate(current_state, candidate)
-                candidate_sections = candidate_state.pruned_sections
                 candidate_metrics = self.formatter.measure_render(candidate_state)
                 if not self._candidate_improves(current_metrics, candidate_metrics):
                     continue
-                options.append((candidate, candidate_sections, candidate_metrics))
+                options.append((candidate, candidate_state, candidate_metrics))
 
             if not options:
                 logger.warning("  ⚠ Deterministic prune stopped: no candidate improved overflow")
                 break
 
-            best_candidate, best_sections, best_metrics = self._select_best_candidate(
+            best_candidate, best_state, best_metrics = self._select_best_candidate(
                 options
             )
 
-            current_state = current_state.model_copy(
+            current_state = best_state.model_copy(
                 update={
-                    "pruned_sections": best_sections,
                     "last_render_page_count": best_metrics.page_count,
                     "last_render_fill_ratio": best_metrics.fill_ratio,
                     "render_iteration": step,

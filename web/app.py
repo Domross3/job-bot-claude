@@ -131,6 +131,10 @@ def _run_pipeline_sync(run_state: RunState, resume_text: str, jd_text: str) -> N
         run_state.events.append({"step": "rendering", "detail": "Generating polished PDF..."})
         state = pipeline._render_and_refine(state)
         page_fit_attempts += max(1, state.render_iteration or 0)
+        if state.last_render_page_count and state.last_render_page_count > 1:
+            raise RuntimeError(
+                f"Draft still renders to {state.last_render_page_count} pages after deterministic fit"
+            )
 
         # Render final PDF to bytes
         buffer = BytesIO()
