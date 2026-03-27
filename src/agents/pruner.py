@@ -39,7 +39,8 @@ class PrunerAgent(BaseAgent):
         parts = [
             "Below is a tailored resume draft (as JSON sections) and the JD analysis.\n"
             "Polish the wording: enforce strong action verbs, cut filler, "
-            "and compress phrasing — but do NOT remove bullets or entries.\n\n"
+            "and compress phrasing — but do NOT remove bullets or entries.\n"
+            "Preserve every entry_id and bullet_ids array exactly as provided.\n\n"
             "=== JD ANALYSIS ===\n"
             f"{analysis_json}\n"
             "=== END JD ANALYSIS ===\n\n"

@@ -23,11 +23,9 @@ from sse_starlette.sse import EventSourceResponse
 # Make src importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.agents import AnalyzerAgent, CriticAgent, FormatterAgent, MapperAgent, PrunerAgent
-from src.state import Evaluation, PipelineState
+from src.agents import FormatterAgent
+from src.pipeline import Pipeline
 from src.utils.ingestor import IngestionError, ingest_file
-from src.utils.resume_normalizer import normalize_project_sections
-from src.utils.resume_parser import parse_source_projects
 from web.supabase_client import get_all_data, log_feedback, log_run
 
 logger = logging.getLogger(__name__)
@@ -89,54 +87,31 @@ def _run_pipeline_sync(run_state: RunState, resume_text: str, jd_text: str) -> N
     page_fit_attempts = 0
 
     try:
-        state = PipelineState(
-            master_resume=resume_text,
-            job_description=jd_text,
-            source_projects=parse_source_projects(resume_text),
-        )
-
-        analyzer = AnalyzerAgent()
-        mapper = MapperAgent()
-        pruner = PrunerAgent()
-        critic = CriticAgent()
+        pipeline = Pipeline()
         formatter = FormatterAgent()
+        state = pipeline.build_initial_state(resume_text, jd_text)
 
         # Step 1: Analyze
         run_state.events.append({"step": "analyzing", "detail": "Extracting requirements from job description..."})
-        state = analyzer.run(state)
+        state = pipeline.analyzer.run(state)
 
         # Steps 2-4: Core loop with critic-driven revisions
         for revision in range(MAX_CRITIC_REVISIONS + 1):
-            # Step 2: Map
-            detail = "Selecting and rewriting relevant experience..."
+            detail = "Scoring and rewriting source bullets..."
             if revision > 0:
-                detail = f"Revision {revision}: re-mapping based on critic feedback..."
+                detail = f"Revision {revision}: re-mapping from source inventory..."
             run_state.events.append({"step": "mapping", "detail": detail})
-            state = mapper.run(state)
-            state = state.model_copy(
-                update={"mapped_sections": normalize_project_sections(state.mapped_sections, state.source_projects)}
-            )
 
-            # Step 3: Prune
-            detail = "Optimizing content for single-page fit..."
+            detail = "Polishing selected draft content..."
             if revision > 0:
-                detail = f"Revision {revision}: re-pruning with critic guidance..."
+                detail = f"Revision {revision}: re-polishing with critic guidance..."
             run_state.events.append({"step": "pruning", "detail": detail})
-            state = pruner.run(state)
-            state = state.model_copy(
-                update={
-                    "pruned_sections": normalize_project_sections(
-                        state.pruned_sections, state.source_projects, max_bullets_per_project=3
-                    )
-                }
-            )
 
-            # Step 4: Critic
             detail = "Verifying factual accuracy and quality..."
             if revision > 0:
                 detail = f"Revision {revision}: re-evaluating improvements..."
             run_state.events.append({"step": "reviewing", "detail": detail})
-            state = critic.run(state)
+            state = pipeline._run_core_loop(state)
 
             # Check if critic approved or we've exhausted revisions
             if state.evaluation and state.evaluation.approved:
@@ -152,74 +127,10 @@ def _run_pipeline_sync(run_state: RunState, resume_text: str, jd_text: str) -> N
             else:
                 logger.info("Max revisions reached or no evaluation — proceeding with best draft")
 
-        # Step 5: Render-and-refine loop (overflow + underfill detection)
+        # Step 5: Render-and-refine loop (deterministic overflow + underfill)
         run_state.events.append({"step": "rendering", "detail": "Generating polished PDF..."})
-        content_floor_attempts = 0
-        CONTENT_FLOOR_RATIO = 0.80
-        MAX_CONTENT_FLOOR_RETRIES = 2
-
-        for iteration in range(1, state.max_render_iterations + 1):
-            page_count = formatter.test_render(state)
-            page_fit_attempts += 1
-
-            if page_count <= 1:
-                # Check content floor — is the page full enough?
-                fill_ratio = formatter.measure_fill_ratio(state)
-                if fill_ratio < CONTENT_FLOOR_RATIO and content_floor_attempts < MAX_CONTENT_FLOOR_RETRIES:
-                    content_floor_attempts += 1
-                    run_state.events.append({
-                        "step": "mapping",
-                        "detail": f"Page only {fill_ratio:.0%} filled — adding more content (attempt {content_floor_attempts})..."
-                    })
-                    logger.warning(
-                        "Content floor: %.0f%% fill — re-mapping (attempt %d/%d)",
-                        fill_ratio * 100, content_floor_attempts, MAX_CONTENT_FLOOR_RETRIES,
-                    )
-                    synthetic_eval = Evaluation(
-                        approved=False,
-                        factual_drift_issues=[],
-                        missing_keywords=state.evaluation.missing_keywords if state.evaluation else [],
-                        suggestions=[
-                            f"CRITICAL: The resume is only {fill_ratio:.0%} filled — it MUST fill at least 80%. "
-                            f"Your CURRENT DRAFT is included below. You must keep ALL existing content and ADD MORE. "
-                            f"Do NOT remove or shorten any existing bullets. Strategies to add content: "
-                            f"(1) Add a 4th bullet to work experience entries that only have 3. "
-                            f"(2) Expand bullets with specific metrics, tools, and outcomes from the master resume. "
-                            f"(3) Add more education bullets (honors, relevant coursework, activities). "
-                            f"(4) Lengthen short one-line bullets into detailed two-liners with context."
-                        ],
-                        overall_score=0.3,
-                    )
-                    state = state.model_copy(update={"evaluation": synthetic_eval})
-                    state = mapper.run(state)
-                    state = state.model_copy(
-                        update={"mapped_sections": normalize_project_sections(state.mapped_sections, state.source_projects)}
-                    )
-                    run_state.events.append({"step": "pruning", "detail": "Re-optimizing expanded content..."})
-                    state = pruner.run(state)
-                    state = state.model_copy(
-                        update={
-                            "pruned_sections": normalize_project_sections(
-                                state.pruned_sections, state.source_projects, max_bullets_per_project=3
-                            )
-                        }
-                    )
-                    continue
-                break
-
-            # Overflow — re-prune
-            overflow_ratio = 1.0 + (0.3 * iteration)
-            state = state.model_copy(
-                update={"overflow_pages": overflow_ratio, "render_iteration": iteration}
-            )
-            state = pruner.run(state)
-            state = state.model_copy(
-                update={
-                    "pruned_sections": normalize_project_sections(
-                        state.pruned_sections, state.source_projects, max_bullets_per_project=3
-                    )
-                }
-            )
+        state = pipeline._render_and_refine(state)
+        page_fit_attempts += max(1, state.render_iteration or 0)
 
         # Render final PDF to bytes
         buffer = BytesIO()

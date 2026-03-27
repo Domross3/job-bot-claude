@@ -14,9 +14,13 @@ from .agents import (
     MapperAgent,
     PrunerAgent,
 )
-from .state import Evaluation, PipelineState, ResumeSection
+from .state import Evaluation, PipelineState, ResumeEntry, ResumeSection
 from .utils.resume_normalizer import normalize_project_sections
-from .utils.resume_parser import parse_source_projects
+from .utils.resume_parser import (
+    build_source_inventory,
+    extract_source_projects,
+    section_kind,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,9 +47,8 @@ class _PruneCandidate:
     """
 
     kind: str
-    section_index: int
-    entry_index: int
-    bullet_index: int | None
+    entry_id: str
+    bullet_id: str | None
     relevance: float          # the entry's relevance_score (0.0–1.0)
     section_priority: float   # tiebreaker: skills=0, projects=1, education=2, work=3
     label: str
@@ -87,6 +90,18 @@ class Pipeline:
         self.critic = CriticAgent()
         self.formatter = FormatterAgent()
 
+    @staticmethod
+    def build_initial_state(master_resume: str, job_description: str) -> PipelineState:
+        """Construct the initial state with deterministic source inventories."""
+        source_sections, source_bullets = build_source_inventory(master_resume)
+        return PipelineState(
+            master_resume=master_resume,
+            job_description=job_description,
+            source_sections=source_sections,
+            source_bullets=source_bullets,
+            source_projects=extract_source_projects(source_sections),
+        )
+
     def run(
         self,
         master_resume: str,
@@ -95,11 +110,7 @@ class Pipeline:
     ) -> PipelineState:
         """Execute the full pipeline."""
 
-        state = PipelineState(
-            master_resume=master_resume,
-            job_description=job_description,
-            source_projects=parse_source_projects(master_resume),
-        )
+        state = self.build_initial_state(master_resume, job_description)
 
         # ── Step 1: Analyze the JD ───────────────────────────────
         state = self.analyzer.run(state)
@@ -175,6 +186,7 @@ class Pipeline:
 
         for attempt in range(max_parity_retries + 1):
             state = self.mapper.run(state)
+            state = self._materialize_mapped_draft(state)
 
             # ── Soft bullet-floor check: retry mapper if <3 bullets ──
             sparse_entries = self._find_sparse_entries(state.mapped_sections)
@@ -199,14 +211,6 @@ class Pipeline:
             elif sparse_entries:
                 logger.warning("  ⚠ Bullet floor still failing after retries — proceeding")
 
-            state = state.model_copy(
-                update={
-                    "mapped_sections": normalize_project_sections(
-                        state.mapped_sections,
-                        state.source_projects,
-                    )
-                }
-            )
             state = self.pruner.run(state)
             state = state.model_copy(
                 update={
@@ -220,6 +224,7 @@ class Pipeline:
 
             # ── Underfill guard: reject pruner output that lost content ──
             state = self._guard_pruner_underfill(state)
+            state = self._capture_polished_bullet_texts(state)
 
             # ── Programmatic number parity gate ──────────────────
             drift_issues = self._check_number_parity(state)
@@ -260,6 +265,228 @@ class Pipeline:
         # ── Run Critic on the (hopefully clean) draft ────────────
         state = self.critic.run(state)
         return state
+
+    def _materialize_mapped_draft(self, state: PipelineState) -> PipelineState:
+        """Select an initial draft deterministically from the full mapped bullet pool."""
+        selected_bullet_ids = self._select_initial_bullet_ids(state)
+        state = state.model_copy(
+            update={
+                "selected_bullet_ids": selected_bullet_ids,
+                "polished_bullet_texts": {},
+            }
+        )
+        mapped_sections = self._assemble_sections_from_selection(state, selected_bullet_ids)
+        return state.model_copy(update={"mapped_sections": mapped_sections})
+
+    def _select_initial_bullet_ids(self, state: PipelineState) -> list[str]:
+        """Choose an initial dense draft from the full mapped bullet inventory."""
+        score_lookup = {bullet.bullet_id: bullet.relevance_score for bullet in state.mapped_bullets}
+        selected: list[str] = []
+
+        for section in state.source_sections:
+            kind = self._section_kind(section.heading)
+
+            if kind == "work":
+                ranked_entries = sorted(
+                    section.entries,
+                    key=lambda entry: self._entry_relevance(entry, score_lookup),
+                    reverse=True,
+                )[:4]
+                keep_entry_ids = {entry.entry_id for entry in ranked_entries}
+                for entry in section.entries:
+                    if entry.entry_id not in keep_entry_ids:
+                        continue
+                    target = 4 if self._entry_relevance(entry, score_lookup) >= 0.80 else 3
+                    selected.extend(
+                        self._pick_top_bullets(
+                            entry,
+                            score_lookup,
+                            target=min(target, len(entry.bullet_ids)),
+                        )
+                    )
+                continue
+
+            if kind == "education":
+                for entry in section.entries:
+                    selected.extend(
+                        self._pick_top_bullets(
+                            entry,
+                            score_lookup,
+                            target=min(4, len(entry.bullet_ids)),
+                        )
+                    )
+                continue
+
+            if kind == "projects":
+                for entry in section.entries:
+                    selected.extend(
+                        self._pick_top_bullets(
+                            entry,
+                            score_lookup,
+                            target=min(2, len(entry.bullet_ids)),
+                        )
+                    )
+                continue
+
+            if kind == "skills":
+                for entry in section.entries:
+                    selected.extend(
+                        self._pick_top_bullets(
+                            entry,
+                            score_lookup,
+                            target=min(4, len(entry.bullet_ids)),
+                        )
+                    )
+                continue
+
+            ranked_other = sorted(
+                section.entries,
+                key=lambda entry: self._entry_relevance(entry, score_lookup),
+                reverse=True,
+            )[:2]
+            keep_other_ids = {entry.entry_id for entry in ranked_other}
+            for entry in section.entries:
+                if entry.entry_id not in keep_other_ids:
+                    continue
+                selected.extend(
+                    self._pick_top_bullets(
+                        entry,
+                        score_lookup,
+                        target=min(1, len(entry.bullet_ids)),
+                    )
+                )
+
+        return selected
+
+    @staticmethod
+    def _pick_top_bullets(entry: ResumeEntry, score_lookup: dict[str, float], target: int) -> list[str]:
+        """Pick the strongest bullets for one entry, preserving source order."""
+        if target <= 0:
+            return []
+
+        ranked = sorted(
+            enumerate(entry.bullet_ids),
+            key=lambda pair: (score_lookup.get(pair[1], 0.0), -pair[0]),
+            reverse=True,
+        )[:target]
+        keep_ids = {bullet_id for _, bullet_id in ranked}
+        return [bullet_id for bullet_id in entry.bullet_ids if bullet_id in keep_ids]
+
+    @staticmethod
+    def _entry_relevance(entry: ResumeEntry, score_lookup: dict[str, float]) -> float:
+        if not entry.bullet_ids:
+            return 0.0
+        return max((score_lookup.get(bullet_id, 0.0) for bullet_id in entry.bullet_ids), default=0.0)
+
+    def _assemble_sections_from_selection(
+        self,
+        state: PipelineState,
+        selected_bullet_ids: list[str],
+    ) -> list[ResumeSection]:
+        """Rebuild ordered resume sections from the deterministic selection set."""
+        selected_set = set(selected_bullet_ids)
+        score_lookup = {bullet.bullet_id: bullet.relevance_score for bullet in state.mapped_bullets}
+        text_lookup = {
+            bullet.bullet_id: bullet.rewritten_text
+            for bullet in state.mapped_bullets
+        }
+        text_lookup.update(state.polished_bullet_texts)
+
+        assembled_sections: list[ResumeSection] = []
+        for section in state.source_sections:
+            assembled_entries: list[ResumeEntry] = []
+            for entry in section.entries:
+                active_bullet_ids = [bullet_id for bullet_id in entry.bullet_ids if bullet_id in selected_set]
+                if not active_bullet_ids:
+                    continue
+
+                bullet_texts = []
+                for bullet_id, source_text in zip(entry.bullet_ids, entry.bullets):
+                    if bullet_id not in selected_set:
+                        continue
+                    bullet_texts.append(text_lookup.get(bullet_id, source_text))
+
+                relevance = max(
+                    (score_lookup.get(bullet_id, 0.0) for bullet_id in active_bullet_ids),
+                    default=0.0,
+                )
+                assembled_entries.append(
+                    entry.model_copy(
+                        update={
+                            "bullets": bullet_texts,
+                            "bullet_ids": active_bullet_ids,
+                            "relevance_score": relevance,
+                        }
+                    )
+                )
+
+            if assembled_entries:
+                assembled_sections.append(
+                    section.model_copy(update={"entries": assembled_entries})
+                )
+
+        return assembled_sections
+
+    def _capture_polished_bullet_texts(self, state: PipelineState) -> PipelineState:
+        """Align quality-polished pruner text back onto the deterministic bullet IDs."""
+        if not state.pruned_sections or not state.selected_bullet_ids:
+            return state
+
+        selected_set = set(state.selected_bullet_ids)
+        source_entry_map = self._source_entry_map(state)
+        polished_texts = dict(state.polished_bullet_texts)
+        mismatch_found = False
+
+        for section in state.pruned_sections:
+            for entry in section.entries:
+                entry_id = entry.entry_id or self._match_source_entry_id(section.heading, entry, source_entry_map)
+                if not entry_id or entry_id not in source_entry_map:
+                    mismatch_found = True
+                    continue
+
+                _, source_entry = source_entry_map[entry_id]
+                expected_ids = [bullet_id for bullet_id in source_entry.bullet_ids if bullet_id in selected_set]
+                if len(expected_ids) != len(entry.bullets):
+                    mismatch_found = True
+                    continue
+
+                for bullet_id, bullet_text in zip(expected_ids, entry.bullets):
+                    polished_texts[bullet_id] = bullet_text
+
+        if mismatch_found:
+            logger.warning("  ⚠ Could not fully align pruner text to source bullet IDs; preserving existing draft text")
+
+        state = state.model_copy(update={"polished_bullet_texts": polished_texts})
+        rebuilt_pruned = self._assemble_sections_from_selection(state, state.selected_bullet_ids)
+        return state.model_copy(update={"pruned_sections": rebuilt_pruned})
+
+    def _source_entry_map(self, state: PipelineState) -> dict[str, tuple[str, ResumeEntry]]:
+        return {
+            entry.entry_id: (self._section_kind(section.heading), entry)
+            for section in state.source_sections
+            for entry in section.entries
+            if entry.entry_id
+        }
+
+    def _match_source_entry_id(
+        self,
+        section_heading: str,
+        entry: ResumeEntry,
+        source_entry_map: dict[str, tuple[str, ResumeEntry]],
+    ) -> str | None:
+        """Best-effort lookup when an LLM response omits entry_id."""
+        target_kind = self._section_kind(section_heading)
+        title_key = self._normalize_text_key(entry.title)
+        org_key = self._normalize_text_key(entry.organization)
+
+        for source_kind, source_entry in source_entry_map.values():
+            if source_kind != target_kind:
+                continue
+            if self._normalize_text_key(source_entry.title) == title_key and self._normalize_text_key(source_entry.organization) == org_key:
+                return source_entry.entry_id
+            if self._normalize_text_key(source_entry.title) == title_key and not org_key:
+                return source_entry.entry_id
+        return None
 
     # Per-section minimum bullet counts (enforced programmatically)
     BULLET_MINIMUMS = {
@@ -342,7 +569,8 @@ class Pipeline:
                         state.mapped_sections,
                         state.source_projects,
                         max_bullets_per_project=3,
-                    )
+                    ),
+                    "polished_bullet_texts": {},
                 }
             )
 
@@ -419,15 +647,15 @@ class Pipeline:
         if (
             underfill_metrics.page_count <= 1
             and underfill_metrics.fill_ratio < _UNDERFILL_THRESHOLD
-            and state.mapped_sections
+            and state.source_bullets
         ):
             logger.info(
-                "  ⚠ Underfill detected: %.0f%% fill — expanding from mapped pool",
+                "  ⚠ Underfill detected: %.0f%% fill — expanding from source inventory",
                 underfill_metrics.fill_ratio * 100,
             )
             print(
                 f"\n  ⚠  Page underfilled ({underfill_metrics.fill_ratio * 100:.0f}% fill) "
-                f"— restoring content from Mapper output"
+                f"— restoring content from source inventory"
             )
             state = self._expand_to_fill(state, underfill_metrics)
 
@@ -453,138 +681,37 @@ class Pipeline:
             )
         return state
 
-    def _enforce_content_floor(self, state: PipelineState, fill_ratio: float) -> PipelineState:
-        """Re-run mapper with guidance to add more content when page is underfilled."""
-        if not hasattr(self, '_content_floor_attempts'):
-            self._content_floor_attempts = 0
-
-        self._content_floor_attempts += 1
-        if self._content_floor_attempts > self.MAX_CONTENT_FLOOR_RETRIES:
-            logger.warning("  ⚠ Content floor: max retries exhausted (%.0f%% fill) — proceeding", fill_ratio * 100)
-            return state
-
-        logger.warning(
-            "  ⚠ Content floor: page only %.0f%% filled (minimum %d%%) — "
-            "re-running mapper to add content (attempt %d/%d)",
-            fill_ratio * 100, int(self.CONTENT_FLOOR_RATIO * 100),
-            self._content_floor_attempts, self.MAX_CONTENT_FLOOR_RETRIES,
-        )
-
-        # Inject synthetic evaluation telling mapper to add more content
-        synthetic_eval = Evaluation(
-            approved=False,
-            factual_drift_issues=[],
-            missing_keywords=state.evaluation.missing_keywords if state.evaluation else [],
-            suggestions=[
-                f"CRITICAL: The resume is only {fill_ratio:.0%} filled — it MUST fill at least "
-                f"{self.CONTENT_FLOOR_RATIO:.0%}. Your CURRENT DRAFT is included below. You must "
-                f"keep ALL existing content and ADD MORE. Do NOT remove or shorten any existing "
-                f"bullets. Strategies: (1) Add a 4th bullet to work entries that only have 3. "
-                f"(2) Expand bullets with specific metrics, tools, and outcomes from the master resume. "
-                f"(3) Add more education bullets (honors, relevant coursework, activities). "
-                f"(4) Lengthen short one-line bullets into detailed two-liners with context."
-            ],
-            overall_score=0.3,
-        )
-        state = state.model_copy(update={"evaluation": synthetic_eval})
-
-        # Re-run mapper → pruner with the feedback
-        state = self.mapper.run(state)
-        state = state.model_copy(
-            update={
-                "mapped_sections": normalize_project_sections(
-                    state.mapped_sections, state.source_projects,
-                )
-            }
-        )
-        state = self.pruner.run(state)
-        state = state.model_copy(
-            update={
-                "pruned_sections": normalize_project_sections(
-                    state.pruned_sections, state.source_projects, max_bullets_per_project=3,
-                )
-            }
-        )
-        return state
-
     def _enforce_project_retention(self, state: PipelineState) -> PipelineState:
-        """Reject pruned drafts that drop source projects before rendering."""
+        """Restore missing source projects deterministically before rendering."""
         if not state.source_projects or not state.pruned_sections:
             return state
-
-        max_restore_attempts = 2
-        project_floor_error = (
-            "CRITICAL ERROR: You deleted a project. You must include all "
-            "projects from the source."
-        )
-
-        for attempt in range(1, max_restore_attempts + 1):
-            draft_projects = self._get_project_entries(state.pruned_sections)
-            missing_projects = self._find_missing_projects(
-                state.source_projects,
-                draft_projects,
-            )
-            if not missing_projects:
-                return state
-
-            missing_labels = ", ".join(
-                self._format_entry_label(entry) for entry in missing_projects
-            )
-            logger.warning(
-                "  ✖ Project retention guardrail failed (attempt %d/%d): %s",
-                attempt,
-                max_restore_attempts,
-                missing_labels,
-            )
-            print(
-                "\n  ✖  Project retention guardrail failed: "
-                f"{missing_labels or 'missing source project(s)'}"
-            )
-            print("     → Rejecting draft and re-running Pruner with source inventory...")
-
-            feedback = [project_floor_error]
-            if missing_labels:
-                feedback.append(f"Missing project(s): {missing_labels}")
-
-            state = state.model_copy(
-                update={
-                    "pruner_feedback": feedback,
-                    "force_source_project_inventory": True,
-                }
-            )
-            state = self.pruner.run(state)
-            state = state.model_copy(
-                update={
-                    "pruned_sections": normalize_project_sections(
-                        state.pruned_sections,
-                        state.source_projects,
-                        max_bullets_per_project=3,
-                    ),
-                    "pruner_feedback": [],
-                    "force_source_project_inventory": False,
-                }
-            )
 
         missing_projects = self._find_missing_projects(
             state.source_projects,
             self._get_project_entries(state.pruned_sections),
         )
-        if missing_projects:
-            logger.warning(
-                "  ⚠ Project retention guardrail fell back to deterministic restore"
-            )
-            print(
-                "     → Pruner still dropped projects; restoring missing source "
-                "projects deterministically before render."
-            )
-            state = state.model_copy(
-                update={
-                    "pruned_sections": self._restore_missing_projects(
-                        state.pruned_sections,
-                        state.source_projects,
-                    )
-                }
-            )
+        if not missing_projects:
+            return state
+
+        missing_labels = ", ".join(
+            self._format_entry_label(entry) for entry in missing_projects
+        )
+        logger.warning(
+            "  ✖ Project retention guardrail restoring missing projects deterministically: %s",
+            missing_labels,
+        )
+        print(
+            "\n  ✖  Project retention guardrail restoring missing project(s): "
+            f"{missing_labels or 'source projects'}"
+        )
+        state = state.model_copy(
+            update={
+                "pruned_sections": self._restore_missing_projects(
+                    state.pruned_sections,
+                    state.source_projects,
+                )
+            }
+        )
 
         return state
 
@@ -601,7 +728,7 @@ class Pipeline:
             if current_metrics.page_count <= 1:
                 return current_state
 
-            candidates = self._enumerate_prune_candidates(current_state.pruned_sections)
+            candidates = self._enumerate_prune_candidates(current_state)
             if not candidates:
                 logger.warning("  ⚠ Deterministic prune stopped: no removable units remain")
                 break
@@ -609,13 +736,8 @@ class Pipeline:
             options = []
 
             for candidate in candidates:
-                candidate_sections = self._apply_prune_candidate(
-                    current_state.pruned_sections,
-                    candidate,
-                )
-                candidate_state = current_state.model_copy(
-                    update={"pruned_sections": candidate_sections}
-                )
+                candidate_state = self._apply_prune_candidate(current_state, candidate)
+                candidate_sections = candidate_state.pruned_sections
                 candidate_metrics = self.formatter.measure_render(candidate_state)
                 if not self._candidate_improves(current_metrics, candidate_metrics):
                     continue
@@ -655,50 +777,29 @@ class Pipeline:
         return current_state
 
     def _expand_to_fill(self, state: PipelineState, metrics) -> PipelineState:
-        """Restore bullets/entries from mapped_sections to fill an underfilled page.
-
-        Walks through mapped_sections looking for content that exists in the
-        Mapper output but was removed from pruned_sections (by the LLM Pruner
-        or the deterministic pruner).  Adds the highest-relevance missing
-        content one unit at a time, re-rendering after each addition, and
-        stops when the fill ratio is in the target band or adding more would
-        overflow.
-        """
+        """Restore omitted source bullets one unit at a time until the page fills."""
         current_state = state
         current_metrics = metrics
 
-        if not state.mapped_sections:
+        if not state.source_bullets:
             return state
 
         for step in range(1, _MAX_EXPAND_STEPS + 1):
             if current_metrics.fill_ratio >= _UNDERFILL_THRESHOLD:
                 return current_state
 
-            # Find restorable content: bullets in mapped but missing from pruned
-            candidates = self._enumerate_expand_candidates(
-                current_state.pruned_sections,
-                state.mapped_sections,
-            )
+            candidates = self._enumerate_expand_candidates(current_state)
             if not candidates:
-                logger.info("  ✔ No more content to restore from Mapper pool")
+                logger.info("  ✔ No more content to restore from source inventory")
                 break
 
-            # Try the highest-relevance candidate first
             for candidate in candidates:
-                expanded_sections = self._apply_expand_candidate(
-                    current_state.pruned_sections,
-                    candidate,
-                )
-                expanded_state = current_state.model_copy(
-                    update={"pruned_sections": expanded_sections}
-                )
+                expanded_state = self._apply_expand_candidate(current_state, candidate)
                 expanded_metrics = self.formatter.measure_render(expanded_state)
 
                 if expanded_metrics.page_count > 1:
-                    # Adding this would overflow — skip it, try next
                     continue
 
-                # Accept this expansion
                 current_state = expanded_state
                 current_metrics = expanded_metrics
                 logger.info(
@@ -711,99 +812,46 @@ class Pipeline:
                 )
                 break
             else:
-                # No candidate could be added without overflow
                 logger.info("  ✔ Expansion stopped: all remaining candidates would overflow")
                 break
 
         return current_state
 
-    def _enumerate_expand_candidates(self, pruned_sections, mapped_sections) -> list[dict]:
-        """Find bullets present in mapped_sections but missing from pruned_sections.
-
-        Returns a list of dicts sorted by relevance (highest first), each
-        describing one restorable unit.
-        """
+    def _enumerate_expand_candidates(self, state: PipelineState) -> list[dict]:
+        """Return omitted source bullets sorted by mapped relevance."""
         candidates: list[dict] = []
 
-        # Index pruned content for fast lookup
-        pruned_bullets_by_entry: dict[tuple[str, str], set[str]] = {}
-        pruned_entry_keys: set[tuple[str, str]] = set()
-        for section in (pruned_sections or []):
-            for entry in section.entries:
-                key = (self._section_kind(section.heading), entry.title.strip().lower())
-                pruned_entry_keys.add(key)
-                pruned_bullets_by_entry[key] = {b.strip().lower() for b in entry.bullets}
+        selected_set = set(state.selected_bullet_ids)
+        score_lookup = {
+            bullet.bullet_id: bullet.relevance_score for bullet in state.mapped_bullets
+        }
 
-        for section in (mapped_sections or []):
-            section_kind = self._section_kind(section.heading)
-            for entry in section.entries:
-                relevance = entry.relevance_score if entry.relevance_score is not None else 0.5
-                key = (section_kind, entry.title.strip().lower())
+        for source_bullet in state.source_bullets:
+            if source_bullet.bullet_id in selected_set:
+                continue
+            candidates.append(
+                {
+                    "bullet_id": source_bullet.bullet_id,
+                    "entry_id": source_bullet.entry_id,
+                    "relevance": score_lookup.get(source_bullet.bullet_id, 0.0),
+                    "label": f"restore bullet in {source_bullet.title or source_bullet.section_heading}",
+                }
+            )
 
-                if key not in pruned_entry_keys and section_kind != "skills":
-                    # Whole entry is missing — can restore it
-                    candidates.append({
-                        "type": "entry",
-                        "section_kind": section_kind,
-                        "section_heading": section.heading,
-                        "entry": entry,
-                        "relevance": relevance,
-                        "label": f"restore entry {entry.title}",
-                    })
-                    continue
-
-                # Check for missing bullets within an existing entry
-                existing_bullets = pruned_bullets_by_entry.get(key, set())
-                for bullet in entry.bullets:
-                    if bullet.strip().lower() not in existing_bullets:
-                        candidates.append({
-                            "type": "bullet",
-                            "section_kind": section_kind,
-                            "entry_title": entry.title,
-                            "bullet": bullet,
-                            "relevance": relevance,
-                            "label": f"restore bullet in {entry.title}",
-                        })
-
-        # Sort by relevance descending — restore highest-value content first
-        candidates.sort(key=lambda c: -c["relevance"])
+        candidates.sort(key=lambda candidate: (-candidate["relevance"], candidate["bullet_id"]))
         return candidates
 
-    def _apply_expand_candidate(self, sections, candidate: dict) -> list[ResumeSection]:
-        """Apply one expansion and return a new section list."""
-        cloned = [s.model_copy(deep=True) for s in (sections or [])]
+    def _apply_expand_candidate(self, state: PipelineState, candidate: dict) -> PipelineState:
+        """Apply one expansion by adding a bullet ID back into the deterministic selection."""
+        selected = list(state.selected_bullet_ids)
+        if candidate["bullet_id"] not in selected:
+            selected.append(candidate["bullet_id"])
+        ordered_selected = self._sort_selected_bullet_ids(state, selected)
+        next_state = state.model_copy(update={"selected_bullet_ids": ordered_selected})
+        rebuilt_sections = self._assemble_sections_from_selection(next_state, ordered_selected)
+        return next_state.model_copy(update={"pruned_sections": rebuilt_sections})
 
-        if candidate["type"] == "entry":
-            # Find or create the target section
-            target_idx = None
-            for idx, section in enumerate(cloned):
-                if self._section_kind(section.heading) == candidate["section_kind"]:
-                    target_idx = idx
-                    break
-
-            if target_idx is not None:
-                cloned[target_idx].entries.append(candidate["entry"].model_copy(deep=True))
-            else:
-                cloned.append(
-                    ResumeSection(
-                        heading=candidate["section_heading"],
-                        entries=[candidate["entry"].model_copy(deep=True)],
-                    )
-                )
-            return cloned
-
-        if candidate["type"] == "bullet":
-            for section in cloned:
-                if self._section_kind(section.heading) != candidate["section_kind"]:
-                    continue
-                for entry in section.entries:
-                    if entry.title.strip().lower() == candidate["entry_title"].strip().lower():
-                        entry.bullets.append(candidate["bullet"])
-                        return cloned
-
-        return cloned
-
-    def _enumerate_prune_candidates(self, sections) -> list[_PruneCandidate]:
+    def _enumerate_prune_candidates(self, state: PipelineState) -> list[_PruneCandidate]:
         """Return removable units sorted by relevance (lowest relevance removed first).
 
         Section minimums are still enforced — we won't enumerate a candidate
@@ -817,35 +865,43 @@ class Pipeline:
         _SECTION_PRIORITY = {"skills": 0.0, "projects": 1.0, "education": 2.0, "work": 3.0, "other": 1.5}
 
         candidates: list[_PruneCandidate] = []
-        if not sections:
+        if not state.source_sections:
             return candidates
 
-        for section_index, section in enumerate(sections):
+        score_lookup = {
+            bullet.bullet_id: bullet.relevance_score for bullet in state.mapped_bullets
+        }
+        selected_set = set(state.selected_bullet_ids)
+
+        for section in state.source_sections:
             section_kind = self._section_kind(section.heading)
             priority = _SECTION_PRIORITY.get(section_kind, 1.5)
+            active_entries = [
+                entry
+                for entry in section.entries
+                if any(bullet_id in selected_set for bullet_id in entry.bullet_ids)
+            ]
 
-            for entry_index, entry in enumerate(section.entries):
-                bullets = entry.bullets or []
-                relevance = entry.relevance_score if entry.relevance_score is not None else 0.5
+            for entry in active_entries:
+                active_bullet_ids = [
+                    bullet_id for bullet_id in entry.bullet_ids if bullet_id in selected_set
+                ]
+                entry_relevance = self._entry_relevance(entry, score_lookup)
 
                 if section_kind == "skills":
-                    # Skills entries don't carry individual relevance; use 0.0
-                    # so they're naturally among the first things cut.
-                    for bullet_index in range(len(bullets) - 1, -1, -1):
+                    for bullet_id in reversed(active_bullet_ids):
                         candidates.append(
                             _PruneCandidate(
                                 kind="skills_line",
-                                section_index=section_index,
-                                entry_index=entry_index,
-                                bullet_index=bullet_index,
+                                entry_id=entry.entry_id or "",
+                                bullet_id=bullet_id,
                                 relevance=0.0,
                                 section_priority=priority,
-                                label=f"remove skills line {bullet_index + 1}",
+                                label=f"remove skills line from {section.heading}",
                             )
                         )
                     continue
 
-                # Determine per-section bullet floor
                 if section_kind == "education":
                     min_bullets = _MIN_EDUCATION_BULLETS
                 elif section_kind == "projects":
@@ -855,29 +911,25 @@ class Pipeline:
                 else:
                     min_bullets = 0
 
-                # Individual bullet removals (last bullet first within an entry)
-                for bullet_index in range(len(bullets) - 1, min_bullets - 1, -1):
+                for bullet_id in active_bullet_ids[min_bullets:]:
                     candidates.append(
                         _PruneCandidate(
                             kind=f"{section_kind}_bullet",
-                            section_index=section_index,
-                            entry_index=entry_index,
-                            bullet_index=bullet_index,
-                            relevance=relevance,
+                            entry_id=entry.entry_id or "",
+                            bullet_id=bullet_id,
+                            relevance=score_lookup.get(bullet_id, entry_relevance),
                             section_priority=priority,
-                            label=f"trim {section_kind} bullet {bullet_index + 1} from {entry.title}",
+                            label=f"trim {section_kind} bullet from {entry.title}",
                         )
                     )
 
-                # Whole-entry removal (only if section has enough entries)
-                if section_kind == "work" and len(section.entries) > 2:
+                if section_kind == "work" and len(active_entries) > 2:
                     candidates.append(
                         _PruneCandidate(
                             kind="work_entry",
-                            section_index=section_index,
-                            entry_index=entry_index,
-                            bullet_index=None,
-                            relevance=relevance,
+                            entry_id=entry.entry_id or "",
+                            bullet_id=None,
+                            relevance=entry_relevance,
                             section_priority=priority,
                             label=f"remove work entry {entry.title}",
                         )
@@ -922,20 +974,23 @@ class Pipeline:
             ),
         )
 
-    def _apply_prune_candidate(self, sections, candidate: _PruneCandidate) -> list[ResumeSection]:
-        """Apply one local trim and return a cleaned copy of the sections."""
-        cloned_sections = [section.model_copy(deep=True) for section in sections or []]
-        section = cloned_sections[candidate.section_index]
+    def _apply_prune_candidate(self, state: PipelineState, candidate: _PruneCandidate) -> PipelineState:
+        """Apply one local trim to the selected bullet ID set and rebuild the draft."""
+        source_entry_map = self._source_entry_map(state)
+        selected = list(state.selected_bullet_ids)
 
         if candidate.kind == "work_entry":
-            del section.entries[candidate.entry_index]
-            return self._cleanup_sections(cloned_sections)
+            _, source_entry = source_entry_map[candidate.entry_id]
+            selected = [
+                bullet_id for bullet_id in selected if bullet_id not in set(source_entry.bullet_ids)
+            ]
+        elif candidate.bullet_id is not None:
+            selected = [bullet_id for bullet_id in selected if bullet_id != candidate.bullet_id]
 
-        entry = section.entries[candidate.entry_index]
-        if candidate.bullet_index is not None:
-            del entry.bullets[candidate.bullet_index]
-
-        return self._cleanup_sections(cloned_sections)
+        ordered_selected = self._sort_selected_bullet_ids(state, selected)
+        next_state = state.model_copy(update={"selected_bullet_ids": ordered_selected})
+        rebuilt_sections = self._assemble_sections_from_selection(next_state, ordered_selected)
+        return next_state.model_copy(update={"pruned_sections": rebuilt_sections})
 
     def _cleanup_sections(self, sections) -> list[ResumeSection]:
         """Drop empty skills entries/sections after a local prune step."""
@@ -957,16 +1012,18 @@ class Pipeline:
     @staticmethod
     def _section_kind(heading: str) -> str:
         """Map a human heading to a stable section kind."""
-        heading_lower = heading.lower()
-        if "skill" in heading_lower:
-            return "skills"
-        if "edu" in heading_lower:
-            return "education"
-        if "project" in heading_lower:
-            return "projects"
-        if "experience" in heading_lower or "work" in heading_lower:
-            return "work"
-        return "other"
+        return section_kind(heading)
+
+    @staticmethod
+    def _sort_selected_bullet_ids(state: PipelineState, bullet_ids: list[str]) -> list[str]:
+        """Return selected bullet IDs in canonical source order."""
+        source_order = {bullet.bullet_id: bullet.order for bullet in state.source_bullets}
+        deduped = list(dict.fromkeys(bullet_ids))
+        return sorted(deduped, key=lambda bullet_id: source_order.get(bullet_id, 10**9))
+
+    @staticmethod
+    def _normalize_text_key(text: str) -> str:
+        return re.sub(r"\s+", " ", (text or "")).strip().lower()
 
     def _find_sparse_work_entries(self, sections, min_bullets: int) -> list[str]:
         """Return work entries that violate the soft bullet floor."""

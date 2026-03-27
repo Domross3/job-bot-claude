@@ -31,10 +31,18 @@ class JDAnalysis(BaseModel):
 class ResumeEntry(BaseModel):
     """A single item within a resume section (role, degree, cert, etc.)."""
 
+    entry_id: str | None = Field(
+        default=None,
+        description="Stable deterministic identifier for this source entry",
+    )
     title: str = Field(description="Role title, degree, or certification name")
     organization: str
     dates: str
     bullets: list[str]
+    bullet_ids: list[str] = Field(
+        default_factory=list,
+        description="Stable source bullet IDs aligned positionally with bullets",
+    )
     relevance_score: float | None = Field(
         default=None, description="Set by Mapper (0.0–1.0)"
     )
@@ -63,6 +71,28 @@ class Evaluation(BaseModel):
     )
 
 
+class SourceBullet(BaseModel):
+    """A single source-truth bullet parsed deterministically from the resume."""
+
+    bullet_id: str
+    entry_id: str
+    section_kind: str
+    section_heading: str
+    title: str
+    organization: str
+    dates: str
+    text: str
+    order: int
+
+
+class MappedBullet(BaseModel):
+    """Mapper output for one source bullet."""
+
+    bullet_id: str
+    rewritten_text: str
+    relevance_score: float = Field(description="0.0–1.0")
+
+
 class PipelineState(BaseModel):
     """Immutable-ish state object threaded through every agent."""
 
@@ -76,9 +106,29 @@ class PipelineState(BaseModel):
     pruned_sections: list[ResumeSection] | None = None
     evaluation: Evaluation | None = None
     final_resume: str | None = None
+    source_sections: list[ResumeSection] = Field(
+        default_factory=list,
+        description="Deterministic full-resume structure parsed from the source resume",
+    )
+    source_bullets: list[SourceBullet] = Field(
+        default_factory=list,
+        description="Flattened source-truth bullet inventory",
+    )
     source_projects: list[ResumeEntry] = Field(
         default_factory=list,
         description="Project entries deterministically parsed from the source master resume",
+    )
+    mapped_bullets: list[MappedBullet] = Field(
+        default_factory=list,
+        description="All source bullets rewritten/scored by the Mapper",
+    )
+    selected_bullet_ids: list[str] = Field(
+        default_factory=list,
+        description="Current deterministic bullet selection used to assemble the draft",
+    )
+    polished_bullet_texts: dict[str, str] = Field(
+        default_factory=dict,
+        description="Quality-polished bullet text keyed by source bullet ID",
     )
     pruner_feedback: list[str] = Field(
         default_factory=list,

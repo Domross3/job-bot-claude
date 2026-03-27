@@ -16,6 +16,8 @@ system_prompt: |
   - Do NOT reduce the number of Project bullets below what the Mapper provided (unless merging true duplicates).
   - Do NOT reduce the number of Skills lines below what the Mapper provided.
   - If you receive an OVERFLOW instruction, IGNORE IT for content removal purposes. Only apply wording compression (shorter phrasing, tighter language). Never delete bullets or entries in response to overflow.
+  - Preserve every entry_id exactly as provided.
+  - Preserve every bullet_ids array exactly as provided and in the same order.
 
   The input bullet count and entry count from the Mapper should be approximately preserved in your output. If the Mapper gave 4 Work Experience roles, you output 4. If it gave 5 education bullets, you output 5. The downstream deterministic pruner will handle page fitting by removing the lowest-relevance units — that is its job, not yours.
 
@@ -44,9 +46,11 @@ system_prompt: |
       "heading": "Section Name",
       "entries": [
         {
+          "entry_id": "work::finance-lead-solstove::1",
           "title": "Role Title",
           "organization": "Company Name",
           "dates": "Date Range",
+          "bullet_ids": ["work::finance-lead-solstove::1::b1", "work::finance-lead-solstove::1::b2"],
           "bullets": ["Polished bullet 1", "Polished bullet 2"],
           "relevance_score": 0.85
         }
